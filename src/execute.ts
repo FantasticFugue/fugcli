@@ -5,7 +5,7 @@ import { type Connection, call, rpc, rpcError, Refused } from "./remote.js";
 import { type Binding, push } from "./checkout/index.js";
 import { localExports, localReports } from "./delivery.js";
 import { object } from "./files.js";
-import { report } from "./proxy.js";
+import { analysisMetadata, fixedAnalysis, report } from "./proxy.js";
 
 export interface Outcome {
     result: Record<string, unknown>;
@@ -22,9 +22,10 @@ export async function execute(
     note: (line: string) => void,
     sync: typeof push = push,
 ): Promise<Outcome> {
+    const fixedView = fixedAnalysis(tool, args);
     let version = typeof args.version === "string" && args.version ? args.version : binding.version;
     let syncSeconds: number | undefined;
-    if (!version) {
+    if (!fixedView && !version && !analysisMetadata(tool, args)) {
         const sent = await sync(core, binding, root);
         report(sent, note);
         version = sent.version;
@@ -66,8 +67,7 @@ export async function execute(
                     arguments: {
                         ...args,
                         project: binding.project,
-                        worldline: binding.worldline,
-                        version,
+                        ...(fixedView ? {} : { worldline: binding.worldline, version }),
                     },
                 },
             },
@@ -116,7 +116,9 @@ export async function execute(
             typeof structured?.ok === "boolean"
                 ? structured.ok && reply.result.isError !== true
                 : reply.result.isError !== true;
-        return { result: reply.result, ok };
+        const queryFailed =
+            tool === "language" && ["failed", "expired"].includes(String(structured?.status));
+        return { result: reply.result, ok: ok && !queryFailed };
     } catch (error) {
         if (interrupted) return { result: {}, ok: false, cancelled: true };
         throw error;
@@ -184,15 +186,20 @@ export function format(tool: string, result: Record<string, unknown>): string[] 
             }
         if (Array.isArray(item.steps))
             for (const step of item.steps) {
-                if (!object(step) || step.exit_code === 0) continue;
+                if (!object(step)) continue;
+                const tasks = Array.isArray(step.tasks) ? step.tasks : [];
+                if (step.exit_code === 0 && tasks.length < 2) continue;
+                const duration =
+                    typeof step.seconds === "number" ? ` in ${step.seconds.toFixed(1)}s` : "";
                 const where =
                     typeof step.output_file === "string" && step.output_file
                         ? ` (full output: ${step.output_file})`
                         : "";
                 lines.push(
-                    `  step ${String(step.name ?? "?")} exited with ${String(step.exit_code)}${where}`,
+                    `  step ${String(step.name ?? "?")}${step.exit_code === 0 ? " completed" : ` exited with ${String(step.exit_code)}`}${duration}${where}`,
                 );
-                if (typeof step.output === "string" && step.output.trim())
+                if (tasks.length) lines.push(`    tasks: ${tasks.join(", ")}`);
+                if (step.exit_code !== 0 && typeof step.output === "string" && step.output.trim())
                     lines.push(
                         ...step.output
                             .trimEnd()
@@ -219,10 +226,21 @@ export function format(tool: string, result: Record<string, unknown>): string[] 
     return lines;
 }
 
-export const languageActions = ["scopes", "symbols", "definitions", "references", "diagnostics"];
+export const languageActions = [
+    "plan",
+    "scopes",
+    "symbols",
+    "definitions",
+    "references",
+    "relations",
+    "impact",
+    "diagnostics",
+    "schema",
+    "describe",
+    "inspect",
+];
 
-// The language query shapes come from the core's semantic model: spans are paths
-// with scalar offsets, locations are one-based lines and scalar columns.
+// Published records retain source ranges and artifact member locations.
 export function formatLanguage(result: Record<string, unknown>): string[] {
     const lines: string[] = [];
     const structured = object(result.structuredContent) ? result.structuredContent : undefined;
@@ -233,53 +251,292 @@ export function formatLanguage(result: Record<string, unknown>): string[] {
                     lines.push(item.text);
         return lines.length ? lines : [JSON.stringify(result.structuredContent ?? null)];
     }
+    if (object(structured.schema)) return [JSON.stringify(structured.schema, null, 2)];
+    if (object(structured.plan)) return [JSON.stringify(structured.plan, null, 2)];
+    if (Array.isArray(structured.providers)) {
+        for (const provider of structured.providers) {
+            if (!object(provider)) continue;
+            lines.push(`${String(provider.id)} (${String(provider.adapter)})`);
+            for (const key of ["languages", "roles", "operations", "facts"] as const)
+                if (Array.isArray(provider[key]) && provider[key].length)
+                    lines.push(`  ${key}: ${provider[key].join(", ")}`);
+            for (const port of Array.isArray(provider.ports) ? provider.ports : [])
+                if (object(port))
+                    lines.push(
+                        `  ${String(port.direction)} ${String(port.name)}: ${String(port.type)}${port.required ? " (required)" : ""}${port.multiple ? " (multiple)" : ""}`,
+                    );
+        }
+        return lines;
+    }
     lines.push(
         `${String(structured.configuration ?? "?")} on ${String(structured.worldline ?? "?")} at ${String(structured.version ?? "?")}` +
             `${structured.stale === true ? " (stale analysis)" : ""}`,
     );
     const stages = formatTimings(structured.timings);
     if (stages) lines.push(stages);
-    const place = (span: unknown): string => {
-        const at = object(span) && object(span.place) ? span.place : undefined;
-        return at ? `${String(at.path)} +${String(at.begin ?? 0)}` : "";
+    const locator = (value: unknown): string => {
+        if (!object(value)) return "";
+        if (object(value.source)) {
+            const at = value.source;
+            const position = object(value.position) ? value.position : undefined;
+            return `${String(at.path)}${position ? `:${String(position.line)}:${String(position.column)}` : ` +${String(at.begin ?? 0)}`}`;
+        }
+        if (object(value.artifact)) {
+            const at = value.artifact;
+            return `${String(at.artifact ?? at.module ?? "?")}:${String(at.member ?? "")} +${String(at.offset ?? 0)}`;
+        }
+        return "";
     };
     if (Array.isArray(structured.diagnostics))
         for (const item of structured.diagnostics) {
             if (!object(item)) continue;
-            const at = place(item.range);
+            const at = locator(item.location);
             lines.push(
                 `${at ? `${at}: ` : ""}${item.severity ? `${item.severity}: ` : ""}${String(item.message ?? "")}`,
             );
         }
-    if (Array.isArray(structured.symbols))
-        for (const item of structured.symbols) {
+    if (typeof structured.view === "string") lines.push(`View: ${structured.view}`);
+    if (structured.status && structured.status !== "complete")
+        lines.push(
+            `Status: ${structured.status}${structured.message ? ` — ${structured.message}` : ""}`,
+        );
+    if (object(structured.coverage) && Array.isArray(structured.coverage.missing))
+        for (const missing of structured.coverage.missing) {
+            if (!object(missing)) continue;
+            const scope = object(missing.scope) ? missing.scope : {};
+            const details = [scope.files, scope.contexts, scope.facts].flatMap((values) =>
+                Array.isArray(values) ? values : [],
+            );
+            lines.push(
+                `Missing: ${String(missing.reason ?? "analysis incomplete")}${details.length ? ` (${details.join(", ")})` : ""}`,
+            );
+        }
+    if (Array.isArray(structured.items) && structured.items.length) {
+        const types = new Map<string, Record<string, unknown>>();
+        if (Array.isArray(structured.types))
+            for (const type of structured.types)
+                if (object(type) && typeof type.id === "string") types.set(type.id, type);
+        const typeName = (id: unknown, visited = new Set<string>()): string => {
+            if (typeof id !== "string") return "?";
+            const type = types.get(id);
+            if (!type || visited.has(id) || visited.size >= 32) return id;
+            visited.add(id);
+            const child = (value: unknown) => typeName(value, new Set(visited));
+            const children = (value: unknown) => (Array.isArray(value) ? value.map(child) : []);
+            const argumentName = (value: unknown, depth = 0): string => {
+                if (!object(value)) return "?";
+                if (depth >= 32) return "…";
+                if (value.kind === "type") return child(value.type);
+                if (value.kind === "pack")
+                    return `pack<${(Array.isArray(value.elements) ? value.elements : []).map((element) => argumentName(element, depth + 1)).join(", ")}>`;
+                const declaration =
+                    typeof value.declaration === "string" ? `[${value.declaration}]` : "";
+                const label = declaration
+                    ? `${String(value.kind)} ${declaration}`
+                    : String(value.value || value.kind);
+                return `${label}${value.type ? `: ${child(value.type)}` : ""}`;
+            };
+            const arguments_ = children(type.arguments);
+            const elements = children(type.elements);
+            const qualifiers = Array.isArray(type.qualifiers) ? type.qualifiers.join(" ") : "";
+            const qualified = (value: string) => (qualifiers ? `${qualifiers} ${value}` : value);
+            if (type.kind === "function") {
+                const groups = Array.isArray(type.parameter_groups) ? type.parameter_groups : [];
+                const generics = children(type.type_parameters);
+                return qualified(
+                    (generics.length ? `<${generics.join(", ")}> ` : "") +
+                        (type.receiver ? `${child(type.receiver)}. ` : "") +
+                        groups
+                            .map((group) =>
+                                object(group) && Array.isArray(group.parameters)
+                                    ? `(${group.parameters.map((parameter) => (object(parameter) ? [...(Array.isArray(parameter.modifiers) ? parameter.modifiers : []), child(parameter.type)].join(" ") : "?")).join(", ")})`
+                                    : "()",
+                            )
+                            .join(" ") +
+                        ` -> ${child(type.return_type)}`,
+                );
+            }
+            if (type.kind === "tuple") return qualified(`(${elements.join(", ")})`);
+            if (type.kind === "intersection") return qualified(elements.join(" & "));
+            if (type.kind === "flexible")
+                return qualified(`(${child(type.lower_bound)} .. ${child(type.upper_bound)})`);
+            if (type.kind === "array")
+                return qualified(
+                    `array<${arguments_[0] ?? elements[0] ?? "?"}${type.array_size === undefined ? "" : `, ${type.array_size}`}>`,
+                );
+            const name = typeof type.name === "string" && type.name ? type.name : String(type.kind);
+            const parameters =
+                type.kind === "application"
+                    ? (Array.isArray(type.application_arguments)
+                          ? type.application_arguments
+                          : []
+                      ).map((argument) => argumentName(argument))
+                    : arguments_.length
+                      ? arguments_
+                      : elements;
+            return qualified(
+                `${name}${type.kind === "application" || parameters.length ? `<${parameters.join(", ")}>` : ""}`,
+            );
+        };
+        for (const item of structured.items) {
             if (!object(item)) continue;
-            lines.push(`${String(item.name ?? "?")} (${String(item.kind ?? "other")})`);
-            for (const key of ["definitions", "declarations"] as const) {
-                const spans = Array.isArray(item[key]) ? item[key] : [];
-                for (const span of spans) {
-                    const at = place(span);
-                    if (at)
-                        lines.push(`  ${key === "definitions" ? "defined" : "declared"} at ${at}`);
+            lines.push(
+                `${String(item.name)} (${String(item.kind)})  ${String(item.symbol_id)}${item.type_id ? `  ${typeName(item.type_id)}` : ""}`,
+            );
+            lines.push(
+                `  Context: ${String(item.context ?? "?")}  Module: ${String(item.module ?? "?")}`,
+            );
+            const declaration = Array.isArray(structured.symbols)
+                ? structured.symbols.find(
+                      (record) =>
+                          object(record) &&
+                          record.id === item.symbol_id &&
+                          object(record.ownership) &&
+                          record.ownership.context === item.context,
+                  )
+                : undefined;
+            if (object(declaration)) {
+                const qualifiers = [
+                    declaration.visibility,
+                    ...(Array.isArray(declaration.modifiers) ? declaration.modifiers : []),
+                ].filter(Boolean);
+                if (qualifiers.length) lines.push(`  Declaration: ${qualifiers.join(" ")}`);
+                const annotations = (value: unknown, indent: string) => {
+                    if (object(value))
+                        for (const [key, data] of Object.entries(value))
+                            lines.push(
+                                `${indent}${key}: ${Array.isArray(data) ? data.join(" ") : JSON.stringify(data)}`,
+                            );
+                };
+                annotations(declaration.extensions, "  ");
+                for (const parameter of Array.isArray(declaration.parameters)
+                    ? declaration.parameters
+                    : []) {
+                    if (!object(parameter)) continue;
+                    lines.push(
+                        `  Parameter ${Number(parameter.group ?? 0) + 1}.${Number(parameter.index ?? 0) + 1}: ${String(parameter.name ?? "(unnamed)")}${parameter.default_value === undefined || parameter.default_value === null ? "" : ` = ${String(parameter.default_value)}`}`,
+                    );
+                    annotations(parameter.annotations, "    ");
                 }
             }
+            for (const key of ["declarations", "definitions"] as const)
+                for (const location of Array.isArray(item[key]) ? item[key] : [])
+                    if (object(location))
+                        lines.push(
+                            `  ${key === "definitions" ? "defined" : "declared"} at ${locator(location)}`,
+                        );
         }
+    }
+    if (structured.status === "ambiguous")
+        lines.push(
+            `Select a candidate with --view ${String(structured.view)} --entity SYMBOL --context CONTEXT.`,
+        );
     if (Array.isArray(structured.scopes))
         for (const item of structured.scopes) {
             if (!object(item)) continue;
-            const at = place(item.range);
+            const at = locator(item.location);
             lines.push(
-                `${String(item.id ?? "?")}  ${String(item.kind ?? "other")} ${String(item.symbol ?? "")}` +
+                `${String(item.id)}  ${String(item.kind)} ${String(item.semantic_owner ?? "")}` +
                     `${item.reference ? ` (${item.reference})` : ""}${at ? `  ${at}` : ""}`,
             );
         }
-    for (const key of ["definitions", "references"] as const)
-        if (Array.isArray(structured[key]))
-            for (const item of structured[key] as unknown[]) {
-                if (!object(item)) continue;
+    const names = new Map<string, string>();
+    for (const item of Array.isArray(structured.items) ? structured.items : [])
+        if (object(item) && typeof item.symbol_id === "string")
+            names.set(item.symbol_id, String(item.name));
+    const entity = (id: unknown) =>
+        names.has(String(id)) ? `${names.get(String(id))} [${String(id)}]` : String(id ?? "?");
+    const records = Array.isArray(structured.references) ? structured.references : [];
+    for (const item of records) {
+        if (!object(item)) continue;
+        const roles = Array.isArray(item.roles) ? item.roles.join("/") : "reference";
+        const targets = item.target
+            ? entity(item.target)
+            : (Array.isArray(item.candidates) ? item.candidates.map(entity).join(", ") : "") || "?";
+        lines.push(
+            `${String(item.id)}  ${roles} ${String(item.resolution)}${item.dispatch ? ` ${item.dispatch}` : ""}  ${targets}  ${locator(item.location)}`,
+        );
+    }
+    for (const item of Array.isArray(structured.relations) ? structured.relations : []) {
+        if (!object(item)) continue;
+        lines.push(
+            `${entity(item.from)} --${String(item.kind)} [${String(item.resolution)}]--> ${entity(item.to)}`,
+        );
+        const source =
+            object(item.ownership) && object(item.ownership.origin)
+                ? locator(item.ownership.origin.location)
+                : "";
+        const origin = [source, item.reference, item.occurrence].filter(Boolean).join("  ");
+        if (origin) lines.push(`  Source: ${origin}`);
+    }
+    const viewNames = new Map<string, Map<string, string>>();
+    const comparison = object(structured.comparison) ? structured.comparison : undefined;
+    if (comparison) {
+        lines.push(`Comparison: ${String(comparison.from_view)} -> ${String(comparison.to_view)}`);
+        for (const evidence of Array.isArray(comparison.evidence) ? comparison.evidence : []) {
+            if (!object(evidence) || typeof evidence.view !== "string") continue;
+            const selected = viewNames.get(evidence.view) ?? new Map<string, string>();
+            for (const item of Array.isArray(evidence.items) ? evidence.items : [])
+                if (object(item) && typeof item.symbol_id === "string")
+                    selected.set(item.symbol_id, String(item.name));
+            viewNames.set(evidence.view, selected);
+        }
+        for (const change of Array.isArray(comparison.changes) ? comparison.changes : []) {
+            if (!object(change) || !object(change.subject)) continue;
+            lines.push(
+                `${Array.isArray(change.kinds) ? change.kinds.join("/") : "change"}: ${String(change.subject.symbol_id)} [${String(change.subject.context)}]`,
+            );
+        }
+    }
+    for (const change of comparison && Array.isArray(comparison.reanalysis)
+        ? comparison.reanalysis
+        : []) {
+        if (!object(change) || !object(change.unit)) continue;
+        lines.push(
+            `Reanalysis: ${String(change.unit.project)}/${String(change.unit.stage)}/${String(change.unit.name)}`,
+        );
+        for (const input of Array.isArray(change.inputs) ? change.inputs : [])
+            if (object(input)) lines.push(`  Input changed: ${String(input.name)}`);
+        for (const dependency of Array.isArray(change.dependencies) ? change.dependencies : [])
+            if (object(dependency) && object(dependency.read))
                 lines.push(
-                    `${String(item.path ?? "?")}:${String(item.line ?? 0)}:${String(item.column ?? 0)}${item.symbol ? `  ${item.symbol}` : ""}`,
+                    `  Dependency ${dependency.unavailable ? "unavailable" : "changed"}: ${String(dependency.read.key)}${dependency.read.channel ? ` [${String(dependency.read.channel)}]` : ""}`,
                 );
-            }
+        for (const task of Array.isArray(change.tasks) ? change.tasks : [])
+            if (object(task))
+                lines.push(
+                    `  Associated ${String(task.operation)}: ${String(task.project)}/${String(task.configuration)}/${String(task.task)}`,
+                );
+    }
+    for (const path of Array.isArray(structured.impact) ? structured.impact : []) {
+        if (!object(path) || !object(path.seed) || !object(path.target)) continue;
+        const label = (id: unknown) => {
+            const name = viewNames.get(String(path.view))?.get(String(id));
+            return name ? `${name} [${String(id)}]` : entity(id);
+        };
+        lines.push(
+            `${comparison ? `[${String(path.view)}] ` : ""}${String(path.category)} impact${path.tentative ? " (candidate)" : ""}: ${label(path.seed.symbol_id)} -> ${label(path.target.symbol_id)}`,
+        );
+        for (const step of Array.isArray(path.steps) ? path.steps : []) {
+            if (!object(step) || !object(step.from) || !object(step.to)) continue;
+            lines.push(
+                `  ${label(step.from.symbol_id)} -> ${label(step.to.symbol_id)}  ${String(step.kind)} ${String(step.evidence)}`,
+            );
+        }
+    }
+    if (typeof structured.cursor === "string")
+        lines.push(
+            comparison
+                ? `Next page: keep the same action, selector, filters and limit, including --from-view ${String(comparison.from_view)} --to-view ${String(comparison.to_view)}; set --cursor to the decoded JSON string below.`
+                : `Next page: keep the same action, selector, filters and limit; set --view to ${String(structured.view)} and --cursor to the decoded JSON string below.`,
+            JSON.stringify(structured.cursor),
+        );
+    if (typeof structured.next_view === "string")
+        lines.push(`Continued view: ${structured.next_view}`);
+    if (typeof structured.continuation === "string")
+        lines.push(
+            "Continue: run fug language --continuation with the decoded JSON string below; --budget-nodes, --budget-units and --budget-ms adjust the request budget.",
+            JSON.stringify(structured.continuation),
+        );
     return lines;
 }

@@ -81,7 +81,6 @@ async function bytes(path: string): Promise<number> {
 }
 
 export interface StateUsage {
-    blobs: number;
     reports: number;
     artifacts: number;
     other: number;
@@ -90,13 +89,13 @@ export interface StateUsage {
 
 export async function stateUsage(root: string): Promise<StateUsage> {
     const state = stateDir(root);
-    const usage: StateUsage = { blobs: 0, reports: 0, artifacts: 0, other: 0, total: 0 };
+    const usage: StateUsage = { reports: 0, artifacts: 0, other: 0, total: 0 };
     for (const entry of await readdir(state).catch((error) => {
         if ((error as NodeJS.ErrnoException).code === "ENOENT") return [] as string[];
         throw error;
     })) {
         const size = await bytes(join(state, entry)).catch(() => 0);
-        if (entry === "blobs" || entry === "reports" || entry === "artifacts") usage[entry] = size;
+        if (entry === "reports" || entry === "artifacts") usage[entry] = size;
         else usage.other += size;
         usage.total += size;
     }

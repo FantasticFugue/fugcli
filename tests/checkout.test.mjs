@@ -53,6 +53,9 @@ async function spit(root, path, content) {
     await writeFile(join(root, path), content);
 }
 
+const noBlobs = (root) =>
+    assert.rejects(readdir(join(root, ".fughetta/state/blobs")), { code: "ENOENT" });
+
 async function project(name) {
     const reply = await call(connection, "PUT", `/api/v1/projects/${name}`, {
         revision: 0,
@@ -693,7 +696,7 @@ test(
             observing.close();
         }
         assert.equal(downloads, 0);
-        assert.equal((await readdir(join(root, ".fughetta/state/blobs"))).length, 40);
+        await noBlobs(root);
     },
 );
 
@@ -713,7 +716,6 @@ for (const installed of [false, true])
             const remote = await worldline(connection, binding, "inspect");
             const after = remote.files.find((file) => file.path === "x.txt");
             const temp = join(root, ".fughetta/state/writeback-interrupted");
-            await writeFile(join(root, ".fughetta/state/blobs", after.digest), "Abc");
             await writeFile(temp, "Abc");
             await mkdir(join(root, ".fughetta/state/pulls"), { recursive: true });
             await writeFile(
@@ -828,7 +830,6 @@ test(
         await writeFile(join(root, "x.txt"), "aBc");
         await rename(join(root, "x.txt"), backup);
         await writeFile(temp, "Abc");
-        await writeFile(join(root, ".fughetta/state/blobs", after.digest), "Abc");
         await writeFile(
             join(root, ".fughetta/state/pulls/captured.json"),
             JSON.stringify({
@@ -870,7 +871,6 @@ test(
         await rename(join(root, "nested/x.txt"), backup);
         await rm(join(root, "nested"), { recursive: true });
         await writeFile(temp, "Abc");
-        await writeFile(join(root, ".fughetta/state/blobs", after.digest), "Abc");
         await writeFile(
             join(root, ".fughetta/state/pulls/captured.json"),
             JSON.stringify({
@@ -909,7 +909,6 @@ for (const linked of [false, true])
             await mkdir(join(root, ".fughetta/state/pulls"), { recursive: true });
             await rename(join(root, "x.txt"), backup);
             await writeFile(temp, "Abc");
-            await writeFile(join(root, ".fughetta/state/blobs", after.digest), "Abc");
             if (linked) await link(temp, join(root, "x.txt"));
             await writeFile(join(root, "x.txt"), linked ? "ABc" : "aBc");
             await writeFile(
@@ -941,41 +940,121 @@ test("remote writeback preserves private file permissions", { skip: service }, a
     assert.equal((await lstat(join(root, "x.txt"))).mode & 0o777, 0o600);
 });
 
-for (const corrupt of [false, true])
-    test(
-        `missing or corrupt baseline cache recovers from its observed version: ${corrupt}`,
-        { skip: service },
-        async () => {
-            const { root, binding } = await checkout(`cache-repair-${corrupt}`, { "x.txt": "abc" });
-            await push(connection, binding, root);
-            const ledger = JSON.parse(
-                await readFile(join(root, ".fughetta/state/baseline.json"), "utf8"),
-            );
-            const blob = join(root, ".fughetta/state/blobs", ledger.files["x.txt"].file.digest);
-            if (corrupt) await writeFile(blob, "bad");
-            else await rm(blob);
-            await elsewhere(binding.project, "remote-edit", [
-                { kind: "edit", path: "x.txt", offset: 0, count: 1, text: "A" },
-            ]);
-            await writeFile(join(root, "x.txt"), "aBc");
-            const result = await push(connection, binding, root);
-            assert.equal(await readFile(join(root, "x.txt"), "utf8"), "ABc");
-            assert.ok(result.updated.includes("x.txt"));
-        },
-    );
+test(
+    "editing a text file sends a minimal edit without a source copy",
+    { skip: service },
+    async () => {
+        const { root, binding } = await checkout("minimal-edit", {
+            "x.txt": "first line\nsecond line\n",
+        });
+        await push(connection, binding, root);
+        await writeFile(join(root, "x.txt"), "first line\nsecond line changed\n");
+        let change;
+        const observing = await proxy((body) => {
+            if (body.includes('"action":"apply"'))
+                change = JSON.parse(body).changes.find((item) => item.path === "x.txt");
+        });
+        try {
+            await push(observing.connection, binding, root);
+        } finally {
+            observing.close();
+        }
+        assert.deepEqual(change, {
+            kind: "edit",
+            path: "x.txt",
+            offset: 22,
+            count: 0,
+            text: " changed",
+        });
+        assert.equal(
+            (await files(binding)).get("x.txt").digest,
+            digest("first line\nsecond line changed\n"),
+        );
+        await noBlobs(root);
+    },
+);
 
 test(
-    "sync collects superseded blobs, unchanged recovery copies and deleted baselines",
+    "a changed baseline file supplies old text from its saved version for a minimal edit",
+    { skip: service },
+    async () => {
+        const { root, binding } = await checkout("baseline-version", { "x.txt": "abc" });
+        await push(connection, binding, root);
+        await elsewhere(binding.project, "remote-edit", [
+            { kind: "edit", path: "x.txt", offset: 0, count: 1, text: "A" },
+        ]);
+        // The working tree no longer holds the recorded baseline, so the old text comes from its version.
+        await writeFile(join(root, "x.txt"), "aBcdef");
+        let reads = 0,
+            change;
+        const observing = await proxy((body) => {
+            if (body.includes('"action":"read"')) ++reads;
+            if (body.includes('"action":"apply"'))
+                change = JSON.parse(body).changes.find((item) => item.path === "x.txt");
+        });
+        let result;
+        try {
+            result = await push(observing.connection, binding, root);
+        } finally {
+            observing.close();
+        }
+        assert.ok(reads >= 1);
+        assert.deepEqual(change, {
+            kind: "edit",
+            path: "x.txt",
+            offset: 1,
+            count: 2,
+            text: "Bcdef",
+        });
+        assert.equal(await readFile(join(root, "x.txt"), "utf8"), "ABcdef");
+        assert.equal((await files(binding)).get("x.txt").digest, digest("ABcdef"));
+        assert.ok(result.updated.includes("x.txt"));
+        await noBlobs(root);
+    },
+);
+
+test(
+    "an iterated edit reads no old text back, because the process keeps what it sent",
+    { skip: service },
+    async () => {
+        const { root, binding } = await checkout("baseline-memory", { "x.txt": "abc" });
+        await push(connection, binding, root);
+        let reads = 0;
+        const observing = await proxy((body) => {
+            if (body.includes('"action":"read"')) ++reads;
+        });
+        try {
+            // Each round rewrites the file the way an agent does, then synchronizes it.
+            for (const text of ["abd", "abe", "abef"]) {
+                reads = 0;
+                await writeFile(join(root, "x.txt"), text);
+                const sent = await push(observing.connection, binding, root);
+                assert.equal(sent.written, 1, text);
+                assert.equal(reads, 0, text);
+                assert.equal((await files(binding)).get("x.txt").digest, digest(text));
+            }
+        } finally {
+            observing.close();
+        }
+        await noBlobs(root);
+    },
+);
+
+test(
+    "sync collects unchanged recovery copies, deleted baselines and stale source copies",
     { skip: service },
     async () => {
         const { root, binding } = await checkout("cache-collection", { "x.txt": "abc" });
         await push(connection, binding, root);
+        await mkdir(join(root, ".fughetta/state/blobs"), { recursive: true });
+        await writeFile(join(root, ".fughetta/state/blobs", "stale"), "dead weight");
+        await push(connection, binding, root);
+        await noBlobs(root);
         for (const text of ["first", "second", "third"]) {
             await elsewhere(binding.project, `remote-${text}`, [
                 { kind: "write", path: "x.txt", text },
             ]);
             await push(connection, binding, root);
-            assert.equal((await readdir(join(root, ".fughetta/state/blobs"))).length, 1);
             assert.equal((await readdir(join(root, ".fughetta/state/recovered"))).length, 2);
         }
         await push(connection, binding, root);
@@ -986,7 +1065,7 @@ test(
             await readFile(join(root, ".fughetta/state/baseline.json"), "utf8"),
         );
         assert.equal(ledger.files["x.txt"], undefined);
-        assert.deepEqual(await readdir(join(root, ".fughetta/state/blobs")), []);
+        await noBlobs(root);
     },
 );
 

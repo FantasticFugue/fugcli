@@ -43,22 +43,90 @@ A core has no workspace prefix or browser sign-in. Hosted requests use
 `FUGHETTA_CA_FILE` selects a PEM certificate authority file for HTTPS.
 
 `init` uses an existing project or creates one. The project name defaults to the
-directory name. A new project starts without build configurations: `fug` does not
-inspect toolchains. The agent reads the repository and sets up builds, tests, and
-analysis with `schema`, `project`, and `save_project`.
+directory name. When the project has no build configurations yet, `init` reads the
+repository's manifests and writes the graphs they already describe, so the first
+`fug build` and `language` call need no setup by the agent:
 
-`init` saves the binding in `.fughetta/project.json`, sends files, and registers
-Fughetta in `.mcp.json`. It also updates `.cursor/mcp.json` when `.cursor` exists.
-Other JSON entries are preserved; malformed JSON is left for manual editing.
-Start your coding agent in the repository after initialization. The registration
-uses `fug` when available on PATH; a source checkout otherwise records absolute
-Node and CLI paths. Install `fug` on PATH and rerun `init` before sharing that file.
+| Manifest found | Build configuration | Analysis stage |
+| --- | --- | --- |
+| `CMakeLists.txt` or `CMakePresets.json` | `debug` from the project's debug preset, else Ninja `build/debug` | `cpp` (clice) |
+| `build.gradle`, `build.gradle.kts`, `settings.gradle` or `settings.gradle.kts` | `jvm` (Gradle model export) | `jvm` (kotlin) |
+| a `.sln` or `.slnx` naming, or a checkout holding, `.fsproj` | `dotnet` (MSBuild restore and model) | `dotnet` (fsharp) |
+| `pyproject.toml` with a `[project]`, `[tool.poetry]`, `[tool.pdm]` or `[build-system]` table | `python` (uv environment) | `python` (ty) |
+
+Each configuration has a `test` operation when the toolchain has one (CTest,
+Gradle `test`, `dotnet test` for a test project, pytest when declared). The stages
+share one `main` analysis profile, the one `fug language` uses when the
+project names a single profile. Build directories the project does not ignore yet
+are recorded in `.fughetta/ignore` so their output is never sent; for .NET these
+are the `bin/` and `obj/` beside each project file, and a `bin/` elsewhere stays in
+the source. A `vcpkg.json` without a toolchain file is reported, because configure
+fails without one. Existing configurations are never replaced: rerunning `init`
+keeps them and says so. A project the detection does not recognize stays without configurations,
+and the agent sets them up with `schema`, `project`, and `save_project`.
+
+`init` writes three things in the project: its own `.fughetta/` directory, which
+holds the binding in `project.json`, and the registration of the MCP server where
+Claude Code (`.mcp.json`) and Codex (`.codex/config.toml`) read it. It creates and
+edits no ignore file, skill or command file of yours. The server itself tells the
+agent how to work with it and offers the `sync`, `build`, `test`, `language` and
+`worldline` prompts, which a client that lists MCP prompts shows as its own
+commands. Other entries in the two registration files are preserved; malformed JSON
+is left for manual editing. Start your coding agent in the repository after
+initialization. The
+registration uses `fug` when available on PATH; a source checkout otherwise records
+absolute Node and CLI paths. Install `fug` on PATH and rerun `init` before sharing
+that file.
 
 ## Commands
 
 Local synchronization time is measured during checkout scanning, upload and writeback, excluding time waiting for the push lock. `push --json` returns `client_sync_seconds`; execution calls send it as `fughetta/client_sync_seconds` in MCP `_meta`, and results return it only in `timings.client_sync_seconds`. The service records this client-reported value beside its queue, dependency, worker sync and execution times for Insights. Human-readable execution results show the measured stages, including the worker total and its environment preparation and commands/analysis sub-stages.
 
 `fug status`, `push`, `build`, `test`, `run`, `language`, `resolve`, and `clean` accept `--text` (the default) or `--json`. `worldline` and `d-mail` accept both switches and default to JSON; `help` also accepts both. Choose one output mode. JSON errors contain `code` and `message` on stderr; service refusals preserve their business code (such as `scope_locked` or `stale_frontier`), while local failures use categories such as `context_required`, `unauthenticated`, `invalid_params`, `missing_objects`, `permission_denied`, `conflict`, `connection_failed`, and `timeout`. HTTP errors without a business code use `http_STATUS`; unexpected failures use `internal_error`. Progress remains on stderr. Exit status is 0 for success, 1 for failure, 2 for an unknown command, and 130 for a cancelled execution.
+
+Use `fug language definitions --path src/main.cpp --symbol render` or the same
+arguments with `references` to query a symbol. Returned locations use one-based
+lines and Unicode scalar columns. `fug language schema --json` reads the service's
+shared semantic contracts. `fug language describe --provider ID` displays a
+provider's operations, facts and typed ports, including configured external helpers.
+Use `fug language inspect --symbol render` to discover
+candidates, then `fug language inspect --view VIEW --entity SYMBOL --include type,scope`
+to query the selected declaration. Search results include persistent symbol IDs,
+contexts and a fixed view. `--limit` and `--cursor` continue pages of that view.
+Use `--context CONTEXT` with `--entity` to select a candidate's compilation context.
+Text output displays structured signatures, type qualifiers and declaration locations.
+Template applications retain ordered type/value arguments, declaration IDs, null pointers and nested parameter packs.
+Inspection also displays declaration visibility, modifiers, attributes and parameter
+names/defaults. Add `--include declarations` to other queries to request these details.
+
+Use `fug language relations --view VIEW --entity SYMBOL --relations aliases,overrides --direction outgoing --depth 2`
+to follow declaration relationships. Relation results retain intermediate entities,
+reference roles and source locations; `--direction incoming` finds incoming edges.
+Use `fug language impact --view VIEW --entity SYMBOL --changes body --depth 4`
+to trace potential behavior changes through callers, bindings and source/artifact
+mappings. `--changes declaration` also follows declaration references; omitting
+the flag includes both categories. Text and JSON results retain path evidence.
+Use `fug language impact --from-view BEFORE --to-view AFTER --depth 4` to classify
+changes and trace paths in both fixed views, including deleted declarations.
+Comparison pages contain changed entities; path evidence identifies its source view.
+Fixed-view comparisons skip source synchronization.
+For another page, preserve the action, selector, filters and limit, use the returned
+view, and pass the decoded cursor string as one argument. Failed queries and expired
+views exit with status 1; the response remains available in text and JSON output.
+Select a profile's outputs with `--configuration NAME --outputs primary,combined`.
+`fug language plan --configuration NAME --outputs primary` displays the selected
+stage graph. `--budget-nodes`, `--budget-units` and `--budget-ms` accept nonnegative
+integers for query and analysis work; configured limits still apply.
+
+Partial results display their missing coverage and a continuation token. Use
+`fug language --continuation TOKEN --budget-nodes 2000` to continue the stored
+query, passing the decoded token string as one argument. Only budget overrides
+accompany a continuation; the token selects its source, profile and query.
+Analysis can return a new `next_view`; use the returned `view` and cursor for
+subsequent pages. For comparison pages, retain both `--from-view` and `--to-view`
+and add `--cursor`; a separate `--view` is unnecessary. Plan, schema, describe,
+fixed-view and continuation requests skip source synchronization in both the CLI
+and MCP proxy.
 
 | Command | Purpose |
 | --- | --- |
@@ -189,7 +257,8 @@ owner revokes it.
 
 Fughetta receives file paths, contents, and executable bits. Text and binary
 files are sent; each file must fit the core's configured size limit. Nested
-`.gitignore` and `.fughettaignore` rules control selection. Version control data,
+`.gitignore` and `.fughettaignore` rules control selection, together with the
+generated directories `init` recorded in `.fughetta/ignore`. Version control data,
 `node_modules/`, and the root `.fughetta/` directory are excluded. Links, special
 files, oversized files, and names refused by the core are skipped and reported.
 Use ignore rules to exclude secrets before initialization.
@@ -200,11 +269,14 @@ are reported as kept. See the sync implementation and its tests for conflict and
 interrupted-push behavior.
 
 Engineering tool results include a synchronization report with updated local
-paths, deferred edits, source conflicts, and preserved content locations. The
-blob cache retains current baselines and pending submissions; missing or corrupt
-baseline blobs are restored from their saved remote versions. Captured files in
-`state/recovered/` are checked on the next sync: unchanged copies are removed,
-while copies changed through an editor's old file handle remain available.
+paths, deferred edits, source conflicts, and preserved content locations.
+Baseline bytes come from the working tree while it still has the recorded digest
+and otherwise from the saved remote version; the checkout keeps no second copy.
+A running `fug mcp` holds the contents it last sent or received in memory, so
+repeated edits to a file read nothing back.
+Captured files in `state/recovered/` are checked on the next sync: unchanged
+copies are removed, while copies changed through an editor's old file handle
+remain available.
 
 ## Tools available to the agent
 
@@ -215,6 +287,8 @@ while copies changed through an editor's old file handle remain available.
 
 The proxy binds project and worldline to the checkout. `build`, `test`, `run`,
 and `language` expose an optional `version`, including names such as `@reviewed`.
+Only the bound top-level `project` and `worldline` input fields are hidden from
+tool schemas; nested configuration fields and result project attribution are retained.
 A supplied version takes precedence over the checkout's pinned version; either
 selection goes directly to the core without sending local changes. In a writable
 checkout without a selected version, the proxy sends local changes before
@@ -236,10 +310,11 @@ Mozilla Public License 2.0. See [LICENSE](LICENSE).
 
 `fug status` shows local cache sizes and pending recovery even without a token or server connection. Remote lookup failures appear as `Remote status unavailable` in text or `remote_error` in JSON; unavailable `build_configurations` are omitted. Local inspection succeeds with exit status 0. `fug resolve --json` lists each saved copy with its original path, version where available, and recovery guidance. After recovering your edits, remove the saved copies you no longer need.
 
-`fug clean` removes delivered logs and downloaded artifacts older than ten minutes. Active deliveries, recent files, source blobs, and recovery copies stay. It reports freed bytes and remaining report/artifact sizes; `--json` returns those values as numbers.
+`fug clean` removes delivered logs and downloaded artifacts older than ten minutes. Active deliveries, recent files, and recovery copies stay. It reports freed bytes and remaining report/artifact sizes; `--json` returns those values as numbers.
 
-The baseline stores file metadata and observed versions; immutable file bytes are
-kept by digest in `.fughetta/state/blobs/`. Unchanged files are not downloaded
+The baseline stores file metadata and observed versions. Baseline bytes come
+from the working tree while it still has the recorded digest and otherwise from
+the worldline version saved for that path; unchanged files are not downloaded
 again. Small writeback records in `state/pulls/` let the next sync finish an
 interrupted installation without treating later local edits as the old baseline.
 

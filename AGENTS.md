@@ -7,7 +7,10 @@ Git, or commit unless the user requests it. Read the user's repository rules and
 
 ## Layout
 
-- `src/cli.ts`: command parsing, project creation, status, MCP registration.
+- `src/cli.ts`: command parsing, project creation, status.
+- `src/setup.ts`: what `fug init` detects in a checkout and the build/test/analysis graphs it saves.
+- `src/mcp.ts`: the registration entry, the JSON files that hold it and the table Codex reads.
+- `src/prompts.ts`: the commands `fug mcp` offers as MCP prompts.
 - `src/login.ts`: OAuth discovery, loopback PKCE sign-in, workspace selection.
 - `src/remote.ts`: origin parsing, authenticated HTTP, MCP calls.
 - `src/credentials.ts`, `src/files.ts`: private token storage, JSON writes, locks.
@@ -16,6 +19,7 @@ Git, or commit unless the user requests it. Read the user's repository rules and
 - `src/worker.ts`: build-machine registration, release download, Worker supervision, systemd user unit.
 - `src/tunnel.ts`: loopback listener relaying Worker TCP connections over the gateway's WebSocket tunnel.
 - `tests/client.test.mjs`, `tests/cli.test.mjs`: client units and real-core workflow.
+- `tests/setup.test.mjs`, `tests/registration.test.mjs`: toolchain detection (including the core validating its output), the two registrations and the prompts.
 - `tests/checkout.test.mjs`: sync tests when supplied by the sync author.
 - `tests/worker.test.mjs`: unit, release download, and a real Worker behind a stand-in gateway.
 - `tests/service.mjs`: real-core test process and scratch directory helpers.

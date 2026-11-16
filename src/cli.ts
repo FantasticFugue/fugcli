@@ -1,12 +1,10 @@
 #!/usr/bin/env node
-import { basename, join, resolve, delimiter } from "node:path";
-import { existsSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { basename, join, resolve } from "node:path";
 import { find, load, save as saveBinding, push } from "./checkout/index.js";
 import { call, origin, responseError, Refused, failure } from "./remote.js";
 import { tokenFor } from "./credentials.js";
 import { connect } from "./login.js";
-import { object, save } from "./files.js";
+import { object } from "./files.js";
 import { report, serve } from "./proxy.js";
 import { hostname } from "node:os";
 import { mail } from "./mail.js";
@@ -14,6 +12,8 @@ import { branches } from "./branches.js";
 import { identity, install, run, savedIdentity, service, uninstall } from "./worker.js";
 import { execute, format, formatLanguage, languageActions } from "./execute.js";
 import { clean, pendingRecovery, stateUsage } from "./inspect.js";
+import { configure, detect } from "./setup.js";
+import { register, registerCodex } from "./mcp.js";
 
 const usage = `Usage: fug init [--server URL] [--workspace NAME] [--name PROJECT] [--token TOKEN]
        fug login [--server URL] [--workspace NAME] [--token TOKEN]
@@ -22,7 +22,14 @@ const usage = `Usage: fug init [--server URL] [--workspace NAME] [--name PROJECT
        fug build [CONFIGURATION ...] [--fresh] [--target TARGET] [--json]
        fug test [CONFIGURATION ...] [--filter FILTER] [--labels LABELS] [--json]
        fug run CONFIGURATION [--json]
-       fug language [ACTION] [--configuration NAME] [--path PATH] [--symbol NAME] [--line N] [--json]
+       fug language [ACTION] [--configuration NAME] [--path PATH] [--symbol NAME] [--json]
+       fug language ACTION --view VIEW --entity SYMBOL [--context CONTEXT] [--limit N] [--cursor CURSOR]
+       fug language relations --view VIEW --entity SYMBOL [--relations KINDS] [--direction outgoing|incoming|both] [--depth N]
+       fug language impact --view VIEW --entity SYMBOL [--changes declaration,body] [--depth N]
+       fug language impact --from-view BEFORE --to-view AFTER [--depth N]
+       fug language plan --configuration NAME [--outputs NAMES]
+       fug language describe [--configuration NAME] [--provider ID]
+       fug language --continuation TOKEN [--budget-nodes N] [--budget-units N] [--budget-ms N]
        fug resolve [--json]
        fug clean [--json]
        fug mcp
@@ -37,8 +44,8 @@ const usage = `Usage: fug init [--server URL] [--workspace NAME] [--name PROJECT
        fug worker [install] [--server URL] [--workspace NAME] [--name MACHINE] [--parallel N] [--service PATH] [--token TOKEN]
        fug worker uninstall [--server URL] --workspace NAME
 
-init    create or use a project, send files and register Fughetta in .mcp.json;
-        the agent configures builds with the project tools
+init    create or use a project, configure the toolchains it detects, send files,
+        and register Fughetta in .mcp.json and .codex/config.toml
 login   sign in and save the origin's token
 push    send this directory's changes
 status  show the binding, local cache use and files pending recovery
@@ -46,7 +53,7 @@ status  show the binding, local cache use and files pending recovery
 build   send this directory and build it on the workspace's workers
 test    send this directory and run the configurations' tests
 run     send this directory and invoke a saved run configuration
-language query scopes, symbols, definitions, references or diagnostics
+  language inspect symbols, types, definitions, references, relations, scopes or diagnostics
         (the default action) on the sent version
 resolve list files set aside by synchronization and how to recover them
 clean   remove cached build logs and downloaded artifacts
@@ -136,32 +143,6 @@ function name(value: string) {
     if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$/.test(value))
         throw new Refused("invalid_params", `Invalid project or workspace name: ${value}`);
     return value;
-}
-function command() {
-    const found = (process.env.PATH ?? "")
-        .split(delimiter)
-        .some((dir) => existsSync(join(dir, process.platform === "win32" ? "fug.cmd" : "fug")));
-    return found
-        ? { command: "fug", args: ["mcp"] }
-        : { command: process.execPath, args: [resolve(process.argv[1]!), "mcp"] };
-}
-export async function register(file: string, entry = command()) {
-    let doc: Record<string, unknown> = {};
-    try {
-        const value = JSON.parse(await readFile(file, "utf8"));
-        if (!object(value)) throw new SyntaxError("Not an object");
-        doc = value;
-    } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-            console.log(
-                `${file} is not a JSON object; add the fughetta server by hand: ${JSON.stringify(entry)}`,
-            );
-            return;
-        }
-    }
-    doc.mcpServers = { ...(object(doc.mcpServers) ? doc.mcpServers : {}), fughetta: entry };
-    await save(file, doc, 0o644);
-    console.log(`Added the fughetta MCP server to ${file}`);
 }
 async function checkout() {
     const root = find(process.cwd());
@@ -256,16 +237,37 @@ function languageArgs(args: string[]): Record<string, unknown> {
         const value = args[++i];
         if (!value || value.startsWith("--"))
             throw new Refused("invalid_params", `${item} needs a value`);
-        if (item === "--path" || item === "--symbol" || item === "--configuration") {
+        if (
+            [
+                "--path",
+                "--symbol",
+                "--configuration",
+                "--provider",
+                "--view",
+                "--from-view",
+                "--to-view",
+                "--entity",
+                "--context",
+                "--module",
+                "--kind",
+                "--include",
+                "--limit",
+                "--cursor",
+                "--relations",
+                "--changes",
+                "--direction",
+                "--depth",
+                "--version",
+                "--outputs",
+                "--continuation",
+                "--budget-nodes",
+                "--budget-units",
+                "--budget-ms",
+            ].includes(item)
+        ) {
             if (out[item.slice(2)] !== undefined)
                 throw new Refused("invalid_params", `Repeated ${item}`);
             out[item.slice(2)] = value;
-        } else if (item === "--line") {
-            if (out.line !== undefined) throw new Refused("invalid_params", "Repeated --line");
-            const line = Number(value);
-            if (!Number.isSafeInteger(line) || line < 1)
-                throw new Refused("invalid_params", "--line must be a positive integer");
-            out.line = line;
         } else throw new Refused("invalid_params", `Unknown option ${item}`);
     }
     if (positional.length > 1)
@@ -278,8 +280,102 @@ function languageArgs(args: string[]): Record<string, unknown> {
             );
         out.action = positional[0];
     }
-    if ((out.action === "definitions" || out.action === "references") && (!out.path || !out.symbol))
-        throw new Refused("invalid_params", `${out.action} needs --path and --symbol`);
+    if (
+        out.continuation &&
+        Object.keys(out).some((key) => key !== "continuation" && !key.startsWith("budget-"))
+    )
+        throw new Refused(
+            "invalid_params",
+            "--continuation accepts budget overrides; its token selects the query and view",
+        );
+    const budget: Record<string, number> = {};
+    for (const option of ["from-view", "to-view"]) {
+        if (out[option] !== undefined) {
+            out[option.replaceAll("-", "_")] = out[option];
+            delete out[option];
+        }
+    }
+    for (const [option, field] of [
+        ["budget-nodes", "nodes"],
+        ["budget-units", "units"],
+        ["budget-ms", "milliseconds"],
+    ] as const) {
+        if (out[option] === undefined) continue;
+        const value = String(out[option]);
+        if (!/^(0|[1-9][0-9]*)$/.test(value) || !Number.isSafeInteger(Number(value)))
+            throw new Refused("invalid_params", `--${option} must be a nonnegative safe integer`);
+        budget[field] = Number(value);
+        delete out[option];
+    }
+    if (Object.keys(budget).length) out.budget = budget;
+    if (out.outputs) {
+        out.outputs = String(out.outputs)
+            .split(",")
+            .map((name) => name.trim());
+        if ((out.outputs as string[]).some((name) => !name))
+            throw new Refused("invalid_params", "--outputs needs comma-separated output names");
+    }
+    if (out.symbol && out.entity)
+        throw new Refused("invalid_params", "Choose --symbol or --entity");
+    if (
+        ["definitions", "references", "inspect"].includes(String(out.action)) &&
+        !out.symbol &&
+        !out.entity
+    )
+        throw new Refused("invalid_params", `${out.action} needs --symbol or --entity`);
+    if (out.context && !out.entity) throw new Refused("invalid_params", "--context needs --entity");
+    if ((out.module || out.kind) && !out.symbol)
+        throw new Refused("invalid_params", "--module and --kind need --symbol");
+    if (out.symbol)
+        out.selector = {
+            name: {
+                text: out.symbol,
+                ...(out.path && ["definitions", "references"].includes(String(out.action))
+                    ? { path: out.path }
+                    : {}),
+                ...(out.module ? { module: out.module } : {}),
+                ...(out.kind ? { kind: out.kind } : {}),
+            },
+        };
+    if (out.entity)
+        out.selector = {
+            entity: { symbol_id: out.entity, ...(out.context ? { context: out.context } : {}) },
+        };
+    if (out.path && !(["definitions", "references"].includes(String(out.action)) && out.symbol))
+        out.scope = { files: [out.path] };
+    for (const key of ["path", "symbol", "entity", "context", "module", "kind"]) delete out[key];
+    if (out.include) out.include = String(out.include).split(",");
+    if (out.changes) {
+        out.changes = String(out.changes)
+            .split(",")
+            .map((kind) => kind.trim());
+        if ((out.changes as string[]).some((kind) => !["declaration", "body"].includes(kind)))
+            throw new Refused("invalid_params", "--changes must contain declaration or body");
+    }
+    if (out.relations) {
+        out.relations = String(out.relations)
+            .split(",")
+            .map((kind) => kind.trim());
+        if ((out.relations as string[]).some((kind) => !kind))
+            throw new Refused("invalid_params", "--relations needs comma-separated edge kinds");
+    }
+    if (out.direction && !["outgoing", "incoming", "both"].includes(String(out.direction)))
+        throw new Refused("invalid_params", "--direction must be outgoing, incoming or both");
+    if (out.depth) {
+        if (!/^[1-9][0-9]*$/.test(String(out.depth)) || !Number.isSafeInteger(Number(out.depth)))
+            throw new Refused("invalid_params", "--depth must be a positive integer");
+        out.depth = Number(out.depth);
+    }
+    if (out.limit) {
+        if (!/^[1-9][0-9]*$/.test(String(out.limit)) || Number(out.limit) > 1000)
+            throw new Refused("invalid_params", "--limit must be between 1 and 1000");
+        out.limit = Number(out.limit);
+    }
+    if (out.cursor && !out.view && !(out.from_view && out.to_view))
+        throw new Refused(
+            "invalid_params",
+            "--cursor needs --view or both --from-view and --to-view",
+        );
     return out;
 }
 async function main() {
@@ -354,11 +450,34 @@ async function main() {
             console.log(`Created the project ${project} on ${core.server}`);
         } else throw responseError(existing);
         await saveBinding(root, binding);
-        await register(join(root, ".mcp.json"));
-        if (existsSync(join(root, ".cursor"))) await register(join(root, ".cursor", "mcp.json"));
+        const note = await register(join(root, ".mcp.json"));
+        if (note) console.log(note);
+        else console.log(`Added the fughetta MCP server to ${join(root, ".mcp.json")}`);
+        const codex = join(root, ".codex", "config.toml");
+        if (await registerCodex(codex)) console.log(`Added the fughetta MCP server to ${codex}`);
+        let setup: Awaited<ReturnType<typeof detect>>;
+        try {
+            setup = await detect(root);
+        } catch (error) {
+            console.error(`fug: toolchain detection skipped: ${failure(error).message}`);
+        }
         report(await push(core, binding, root), console.log, console.error);
+        if (setup) {
+            for (const warning of setup.summary.filter((line) => !line.startsWith("Configured")))
+                console.error(`fug: ${warning}`);
+            try {
+                const lines = await configure(core, project, root, setup);
+                if (lines) for (const line of lines) console.log(line);
+                else console.log("Kept the project's existing build configurations");
+            } catch (error) {
+                console.error(
+                    `fug: the detected toolchains were not saved: ${failure(error).message}`,
+                );
+                process.exitCode = 1;
+            }
+        }
         console.log(
-            "Start your agent in this directory; it finds the Fughetta tools through .mcp.json.",
+            "Start Claude Code or Codex in this directory; it finds the Fughetta tools through the registration.",
         );
     } else if (cmd === "status" && !args.length) {
         const local = await checkout();
@@ -402,7 +521,7 @@ async function main() {
             console.log(`Build configurations: ${configurations.join(", ") || "none"}`);
         if (remoteError) console.log(`Remote status unavailable: ${remoteError.message}`);
         console.log(
-            `Local state: ${volume(usage.total)} (blobs ${volume(usage.blobs)}, reports ${volume(usage.reports)}, artifacts ${volume(usage.artifacts)})`,
+            `Local state: ${volume(usage.total)} (reports ${volume(usage.reports)}, artifacts ${volume(usage.artifacts)})`,
         );
         if (pending.length)
             console.log(

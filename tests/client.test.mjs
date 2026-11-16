@@ -5,6 +5,7 @@ import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
 import { writeFile, readFile, rm, stat, readdir, mkdir } from "node:fs/promises";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { authorize, metadata, connect } from "../build/login.js";
 import { origin, call, tool, rpc, Refused } from "../build/remote.js";
 import { tokenFor, credentialFile } from "../build/credentials.js";
@@ -235,14 +236,42 @@ test("MCP request errors, push failure, reports, tool filtering and project inje
                         "save_server",
                     ].map((name) => ({
                         name,
-                        inputSchema: {
+                        inputSchema:
+                            name === "save_project"
+                                ? {
+                                      $ref: "#/$defs/input",
+                                      $defs: {
+                                          input: {
+                                              properties: {
+                                                  project: { type: "string" },
+                                                  body: {
+                                                      properties: { project: {} },
+                                                      required: ["project"],
+                                                  },
+                                              },
+                                              required: ["project", "body"],
+                                          },
+                                      },
+                                  }
+                                : {
+                                      properties: {
+                                          project: { type: "string" },
+                                          worldline: {},
+                                          version: {},
+                                          nested: {
+                                              properties: { project: {} },
+                                              required: ["project"],
+                                          },
+                                      },
+                                      required: ["project"],
+                                  },
+                        outputSchema: {
                             properties: {
-                                project: { type: "string" },
-                                worldline: {},
-                                version: {},
-                                nested: { properties: { project: {} }, required: ["project"] },
+                                snapshot: {
+                                    properties: { project: { type: "string" } },
+                                    required: ["project"],
+                                },
                             },
-                            required: ["project"],
                         },
                     })),
                 },
@@ -296,7 +325,16 @@ test("MCP request errors, push failure, reports, tool filtering and project inje
             ["build", "save_project", "schema"],
         );
         for (const name of ["project", "worldline"])
-            assert.ok(!JSON.stringify(tools).includes(`"${name}"`));
+            assert.ok(!Object.hasOwn(tools[0].inputSchema.properties, name));
+        assert.deepEqual(tools[0].inputSchema.properties.nested.required, ["project"]);
+        assert.ok(Object.hasOwn(tools[0].inputSchema.properties.nested.properties, "project"));
+        const saveSchema = tools.find((tool) => tool.name === "save_project").inputSchema.$defs
+            .input;
+        assert.deepEqual(saveSchema.required, ["body"]);
+        assert.ok(!Object.hasOwn(saveSchema.properties, "project"));
+        assert.ok(Object.hasOwn(saveSchema.properties.body.properties, "project"));
+        assert.deepEqual(tools[0].outputSchema.properties.snapshot.required, ["project"]);
+        assert.ok(Object.hasOwn(tools[0].outputSchema.properties.snapshot.properties, "project"));
         assert.ok(Object.hasOwn(tools[0].inputSchema.properties, "version"));
         await send(3, "tools/call", {
             name: "build",
@@ -391,6 +429,21 @@ test("MCP selects named source and executes a pinned checkout without pushing", 
         };
         await invoke(current, "build", { version: "@reviewed" });
         await invoke(current, "test", { version: "@reviewed" });
+        await invoke(current, "language", { action: "schema" });
+        await invoke(current, "language", {
+            action: "plan",
+            configuration: "paired",
+            outputs: ["combined"],
+        });
+        await invoke(current, "language", {
+            continuation: "resume-original",
+            budget: { nodes: 2000 },
+        });
+        await invoke(fixed, "language", {
+            action: "inspect",
+            view: "view-published",
+            selector: { entity: { symbol_id: "symbol-render" } },
+        });
         await invoke(fixed, "configurations");
         for (const name of ["build", "test", "run", "language"]) await invoke(fixed, name);
         await invoke(fixed, "build", { version: "@other" });
@@ -399,6 +452,21 @@ test("MCP selects named source and executes a pinned checkout without pushing", 
             [
                 { project: "demo", worldline: "main", version: "@reviewed" },
                 { project: "demo", worldline: "main", version: "@reviewed" },
+                { project: "demo", worldline: "main", action: "schema" },
+                {
+                    project: "demo",
+                    worldline: "main",
+                    action: "plan",
+                    configuration: "paired",
+                    outputs: ["combined"],
+                },
+                { project: "demo", continuation: "resume-original", budget: { nodes: 2000 } },
+                {
+                    project: "demo",
+                    action: "inspect",
+                    view: "view-published",
+                    selector: { entity: { symbol_id: "symbol-render" } },
+                },
                 { project: "demo" },
                 ...Array.from({ length: 4 }, () => ({
                     project: "demo",
@@ -983,7 +1051,22 @@ test("execute surfaces a failed result and transport errors", async () => {
                                 ok: false,
                                 seconds: 0.5,
                                 worker: "w1",
-                                steps: [{ name: "build", exit_code: 1, output: "boom\n" }],
+                                steps: [
+                                    {
+                                        name: "batch",
+                                        tasks: ["managed/prepare", "managed/model"],
+                                        seconds: 1.2,
+                                        exit_code: 0,
+                                        output: "prepared\n",
+                                    },
+                                    {
+                                        name: "batch",
+                                        tasks: ["managed/build", "managed/test"],
+                                        seconds: 0.5,
+                                        exit_code: 1,
+                                        output: "boom\n",
+                                    },
+                                ],
                                 diagnostics: [
                                     {
                                         file: "main.cpp",
@@ -1017,7 +1100,10 @@ test("execute surfaces a failed result and transport errors", async () => {
         const lines = format("test", outcome.result);
         assert.ok(lines.some((line) => line.includes("FAILED  debug")));
         assert.ok(lines.some((line) => line.includes("main.cpp:3:5: error: expected a semicolon")));
-        assert.ok(lines.some((line) => line.includes("step build exited with 1")));
+        assert.ok(lines.some((line) => line.includes("step batch completed in 1.2s")));
+        assert.ok(lines.some((line) => line.includes("tasks: managed/prepare, managed/model")));
+        assert.ok(lines.some((line) => line.includes("step batch exited with 1 in 0.5s")));
+        assert.ok(lines.some((line) => line.includes("tasks: managed/build, managed/test")));
         assert.ok(lines.some((line) => line.includes("    boom")));
         assert.ok(lines.some((line) => line.includes("test failed: 0/1 configuration")));
         failed = false;
@@ -1041,9 +1127,38 @@ test("execute surfaces a failed result and transport errors", async () => {
 
 test("execute runs a language query and formats its results", async () => {
     const requests = [];
+    let status = "complete";
     const s = await server(async (req, res) => {
         const r = JSON.parse(await body(req));
         requests.push(r);
+        if (r.params.arguments.action === "describe")
+            return reply(res, {
+                jsonrpc: "2.0",
+                id: r.id,
+                result: {
+                    isError: false,
+                    content: [],
+                    structuredContent: {
+                        providers: [
+                            {
+                                id: "configured-kotlin",
+                                adapter: "helper",
+                                languages: ["kotlin"],
+                                operations: ["evaluate"],
+                                facts: ["symbols"],
+                                ports: [
+                                    {
+                                        name: "project_model",
+                                        type: "project_model",
+                                        direction: "input",
+                                        required: true,
+                                    },
+                                ],
+                            },
+                        ],
+                    },
+                },
+            });
         reply(res, {
             jsonrpc: "2.0",
             id: r.id,
@@ -1051,6 +1166,7 @@ test("execute runs a language query and formats its results", async () => {
                 isError: false,
                 content: [],
                 structuredContent: {
+                    status,
                     configuration: "cpp",
                     worldline: "main",
                     version: "v1",
@@ -1058,29 +1174,27 @@ test("execute runs a language query and formats its results", async () => {
                     analyzed: true,
                     diagnostics: [
                         {
-                            range: { place: { path: "main.cpp", begin: 40, end: 45 } },
+                            id: "diagnostic-1",
+                            location: { source: { path: "main.cpp", begin: 40, end: 45 } },
                             severity: "error",
                             message: "unknown name",
                         },
                     ],
-                    symbols: [
+                    items: [
                         {
-                            id: "s1",
+                            symbol_id: "s1",
+                            context: "cpp",
+                            module: "app",
                             name: "main",
                             kind: "function",
-                            scope: "",
                             declarations: [],
-                            definitions: [{ place: { path: "main.cpp", begin: 0, end: 4 } }],
-                        },
-                    ],
-                    definitions: [
-                        {
-                            path: "main.cpp",
-                            line: 3,
-                            column: 5,
-                            end_line: 3,
-                            end_column: 9,
-                            symbol: "main",
+                            definitions: [
+                                { source: { path: "main.cpp", begin: 0, end: 4 } },
+                                {
+                                    source: { path: "main.cpp", begin: 40, end: 44 },
+                                    position: { line: 3, column: 5, end_line: 3, end_column: 9 },
+                                },
+                            ],
                         },
                     ],
                 },
@@ -1111,7 +1225,379 @@ test("execute runs a language query and formats its results", async () => {
         assert.ok(lines.some((line) => line.includes("main.cpp +40: error: unknown name")));
         assert.ok(lines.some((line) => line.includes("main (function)")));
         assert.ok(lines.some((line) => line.includes("defined at main.cpp +0")));
-        assert.ok(lines.some((line) => line.includes("main.cpp:3:5  main")));
+        assert.ok(lines.some((line) => line.includes("defined at main.cpp:3:5")));
+        await execute(
+            { server: s.url, workspace: "", token: "t" },
+            binding,
+            root,
+            "language",
+            { action: "references", selector: { name: { text: "main", path: "main.cpp" } } },
+            () => {},
+            async () => pushed,
+        );
+        assert.deepEqual(requests.at(-1).params.arguments.selector, {
+            name: { text: "main", path: "main.cpp" },
+        });
+        await execute(
+            { server: s.url, workspace: "", token: "t" },
+            binding,
+            root,
+            "language",
+            { action: "schema" },
+            () => {},
+            async () => {
+                throw new Error("Schema must not push");
+            },
+        );
+        assert.equal(requests.at(-1).params.arguments.version, undefined);
+        assert.deepEqual(
+            formatLanguage({ structuredContent: { schema: { request: { type: "object" } } } }),
+            [JSON.stringify({ request: { type: "object" } }, null, 2)],
+        );
+        const cursor = JSON.stringify({ query: "references", offset: 1 });
+        const semantic = formatLanguage({
+            structuredContent: {
+                configuration: "cpp",
+                worldline: "main",
+                version: "v1",
+                view: "view-1",
+                items: [
+                    {
+                        symbol_id: "render",
+                        context: "cpp-debug",
+                        module: "app",
+                        name: "render",
+                        kind: "function",
+                        type_id: "signature",
+                        declarations: [
+                            {
+                                source: { path: "api.h", begin: 8, end: 14 },
+                                position: { line: 2, column: 1, end_line: 2, end_column: 7 },
+                            },
+                        ],
+                        definitions: [
+                            {
+                                source: { path: "main.cpp", begin: 20, end: 26 },
+                                position: { line: 3, column: 5, end_line: 3, end_column: 11 },
+                            },
+                        ],
+                    },
+                    {
+                        symbol_id: "packet",
+                        name: "packet",
+                        kind: "variable",
+                        context: "cpp-debug",
+                        type_id: "packet-type",
+                    },
+                ],
+                types: [
+                    {
+                        id: "signature",
+                        kind: "function",
+                        parameter_groups: [{ parameters: [{ type: "buffer" }, { type: "node" }] }],
+                        return_type: "int",
+                    },
+                    { id: "int", kind: "primitive", name: "int" },
+                    { id: "buffer", kind: "array", arguments: ["pointer"], array_size: 4 },
+                    { id: "pointer", kind: "pointer", arguments: ["int"], qualifiers: ["const"] },
+                    {
+                        id: "node",
+                        kind: "application",
+                        name: "Node",
+                        arguments: ["node"],
+                        application_arguments: [{ kind: "type", type: "node" }],
+                    },
+                    {
+                        id: "packet-type",
+                        kind: "application",
+                        name: "Packet",
+                        arguments: ["int"],
+                        application_arguments: [
+                            { kind: "template", declaration: "tag" },
+                            { kind: "declaration", declaration: "marker", type: "pointer" },
+                            { kind: "integral", value: "7", type: "int" },
+                            { kind: "null_pointer", value: "nullptr", type: "pointer" },
+                            {
+                                kind: "pack",
+                                elements: [
+                                    { kind: "type", type: "int" },
+                                    { kind: "type", type: "node" },
+                                    { kind: "pack", elements: [] },
+                                ],
+                            },
+                        ],
+                    },
+                ],
+                symbols: [
+                    {
+                        id: "render",
+                        ownership: { context: "cpp-debug" },
+                        visibility: "public",
+                        modifiers: ["const"],
+                        extensions: { "cpp.attributes": ["[[nodiscard]]"] },
+                        parameters: [
+                            { group: 0, index: 0, name: "buffer" },
+                            {
+                                group: 0,
+                                index: 1,
+                                name: "node",
+                                default_value: "{}",
+                                annotations: { "cpp.attributes": ["[[maybe_unused]]"] },
+                            },
+                        ],
+                    },
+                ],
+                references: [
+                    {
+                        id: "call-render",
+                        from: "caller",
+                        target: "render",
+                        roles: ["call"],
+                        resolution: "resolved",
+                        location: {
+                            source: { path: "caller.cpp", begin: 90, end: 96 },
+                            position: { line: 9, column: 2, end_line: 9, end_column: 8 },
+                        },
+                    },
+                ],
+                cursor,
+            },
+        });
+        assert.ok(
+            semantic.some((line) =>
+                line.includes("(array<const pointer<int>, 4>, Node<node>) -> int"),
+            ),
+        );
+        assert.ok(semantic.includes("  Context: cpp-debug  Module: app"));
+        assert.ok(
+            semantic.some((line) =>
+                line.includes(
+                    "Packet<template [tag], declaration [marker]: const pointer<int>, 7: int, nullptr: const pointer<int>, pack<int, Node<node>, pack<>>>",
+                ),
+            ),
+        );
+        assert.ok(semantic.includes("  Declaration: public const"));
+        assert.ok(semantic.includes("  cpp.attributes: [[nodiscard]]"));
+        assert.ok(semantic.includes("  Parameter 1.1: buffer"));
+        assert.ok(semantic.includes("  Parameter 1.2: node = {}"));
+        assert.ok(semantic.includes("    cpp.attributes: [[maybe_unused]]"));
+        assert.ok(semantic.includes("  declared at api.h:2:1"));
+        assert.equal(semantic.filter((line) => line.includes("main.cpp:3:5")).length, 1);
+        assert.ok(semantic.some((line) => line.endsWith("  caller.cpp:9:2")));
+        assert.equal(JSON.parse(semantic.at(-1)), cursor);
+        const continuation = JSON.stringify({
+            view: "view-1",
+            cursor: "retained-query",
+        });
+        const partial = formatLanguage({
+            structuredContent: {
+                status: "partial",
+                view: "view-1",
+                cursor,
+                continuation,
+                coverage: {
+                    missing: [
+                        {
+                            reason: "the view was prepared for selected files",
+                            scope: { files: ["other.cpp"] },
+                        },
+                    ],
+                },
+            },
+        });
+        assert.ok(
+            partial.includes("Missing: the view was prepared for selected files (other.cpp)"),
+        );
+        assert.equal(JSON.parse(partial.at(-1)), continuation);
+        assert.ok(partial.some((line) => line.startsWith("Next page:")));
+        assert.ok(
+            partial.some((line) => line.startsWith("Continue: run fug language --continuation")),
+        );
+        assert.ok(
+            formatLanguage({ structuredContent: { next_view: "view-2" } }).includes(
+                "Continued view: view-2",
+            ),
+        );
+        const graph = formatLanguage({
+            structuredContent: {
+                cursor,
+                comparison: {
+                    from_view: "before",
+                    to_view: "after",
+                    changes: [{ subject: { symbol_id: "b", context: "cpp" }, kinds: ["removed"] }],
+                    reanalysis: [
+                        {
+                            unit: { project: "app", stage: "source", name: "main" },
+                            inputs: [{ name: "main.fs" }],
+                            dependencies: [],
+                            tasks: [
+                                {
+                                    project: "app",
+                                    configuration: "native",
+                                    task: "test",
+                                    operation: "test",
+                                },
+                            ],
+                        },
+                    ],
+                    evidence: [
+                        {
+                            view: "before",
+                            items: [
+                                { symbol_id: "a", name: "Alias" },
+                                { symbol_id: "b", name: "Base" },
+                            ],
+                        },
+                    ],
+                },
+                impact: [
+                    {
+                        view: "before",
+                        category: "semantic",
+                        seed: { symbol_id: "b" },
+                        target: { symbol_id: "a" },
+                        steps: [
+                            {
+                                from: { symbol_id: "b" },
+                                to: { symbol_id: "a" },
+                                kind: "reference",
+                                evidence: "use",
+                            },
+                        ],
+                    },
+                ],
+                items: [
+                    { symbol_id: "a", name: "Alias", kind: "type" },
+                    { symbol_id: "b", name: "Base", kind: "type" },
+                ],
+                references: [
+                    {
+                        id: "use",
+                        target: "b",
+                        roles: ["type"],
+                        resolution: "resolved",
+                        location: { source: { path: "api.h", begin: 12, end: 16 } },
+                    },
+                ],
+                relations: [
+                    {
+                        from: "a",
+                        to: "b",
+                        kind: "aliases",
+                        resolution: "resolved",
+                        reference: "use",
+                        occurrence: "decl",
+                        ownership: {
+                            origin: { location: { source: { path: "api.h", begin: 0, end: 16 } } },
+                        },
+                    },
+                ],
+            },
+        });
+        assert.ok(graph.includes("Alias [a] --aliases [resolved]--> Base [b]"));
+        assert.ok(graph.includes("  Source: api.h +0  use  decl"));
+        assert.ok(graph.includes("use  type resolved  Base [b]  api.h +12"));
+        assert.ok(graph.includes("[before] semantic impact: Base [b] -> Alias [a]"));
+        assert.ok(graph.includes("Comparison: before -> after"));
+        assert.ok(
+            graph.some(
+                (line) =>
+                    line.startsWith("Next page:") &&
+                    line.includes("--from-view before --to-view after"),
+            ),
+        );
+        assert.ok(graph.includes("Reanalysis: app/source/main"));
+        assert.ok(graph.includes("  Associated test: app/native/test"));
+        assert.ok(graph.includes("removed: b [cpp]"));
+        assert.ok(graph.includes("  Base [b] -> Alias [a]  reference use"));
+        await mkdir(join(root, ".fughetta"), { recursive: true });
+        await writeFile(
+            join(root, ".fughetta", "project.json"),
+            JSON.stringify({ ...binding, server: s.url }),
+        );
+        async function languageCLI(args) {
+            const child = spawn(
+                process.execPath,
+                [fileURLToPath(new URL("../build/cli.js", import.meta.url)), "language", ...args],
+                {
+                    cwd: root,
+                    env: { ...process.env, FUGHETTA_TOKEN: "t" },
+                    stdio: ["ignore", "pipe", "pipe"],
+                },
+            );
+            let output = "",
+                error = "";
+            child.stdout.on("data", (chunk) => {
+                output += chunk;
+            });
+            child.stderr.on("data", (chunk) => {
+                error += chunk;
+            });
+            const code = await new Promise((resolve, reject) => {
+                child.on("error", reject);
+                child.on("exit", resolve);
+            });
+            assert.equal(code, 0, error);
+            return output;
+        }
+        await languageCLI([
+            "impact",
+            "--from-view",
+            "view-0",
+            "--to-view",
+            "view-1",
+            "--entity",
+            "a",
+            "--relations",
+            "aliases,overrides",
+            "--changes",
+            "declaration",
+            "--direction",
+            "incoming",
+            "--depth",
+            "2",
+            "--cursor",
+            cursor,
+            "--json",
+        ]);
+        const request = requests.at(-1).params.arguments;
+        assert.equal(request.action, "impact");
+        assert.equal(request.from_view, "view-0");
+        assert.equal(request.to_view, "view-1");
+        assert.deepEqual(request.changes, ["declaration"]);
+        assert.deepEqual(request.selector, { entity: { symbol_id: "a" } });
+        assert.deepEqual(request.relations, ["aliases", "overrides"]);
+        assert.equal(request.direction, "incoming");
+        assert.equal(request.depth, 2);
+        assert.equal(request.cursor, cursor);
+        assert.equal(request.view, undefined);
+        const description = await languageCLI(["describe", "--provider", "configured-kotlin"]);
+        assert.ok(description.includes("configured-kotlin (helper)"));
+        assert.ok(description.includes("input project_model: project_model (required)"));
+        assert.equal(requests.at(-1).params.arguments.provider, "configured-kotlin");
+        assert.equal(requests.at(-1).params.arguments.version, undefined);
+        const ambiguity = formatLanguage({
+            structuredContent: { status: "ambiguous", view: "view-1", items: [] },
+        });
+        assert.ok(
+            ambiguity.includes(
+                "Select a candidate with --view view-1 --entity SYMBOL --context CONTEXT.",
+            ),
+        );
+        status = "expired";
+        const expired = await execute(
+            { server: s.url, workspace: "", token: "t" },
+            binding,
+            root,
+            "language",
+            { action: "inspect", view: "view-1", selector: { entity: { symbol_id: "render" } } },
+            () => {},
+            async () => {
+                throw new Error("A fixed view must not push");
+            },
+        );
+        assert.equal(expired.ok, false);
+        assert.equal(expired.result.structuredContent.status, "expired");
     } finally {
         await s.stop();
         await rm(root, { recursive: true, force: true });

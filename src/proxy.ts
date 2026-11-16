@@ -5,6 +5,7 @@ import { type Connection, rpc, call, responseError } from "./remote.js";
 import { type Binding, type Pushed, push, changed, stateDir } from "./checkout/index.js";
 import { object, save } from "./files.js";
 import { localReports, localExports, reportSchema } from "./delivery.js";
+import { listed, prompted } from "./prompts.js";
 
 const routes: Record<string, [string, boolean]> = Object.fromEntries([
     ...["configurations", "build", "test", "run", "language"].map((n) => [n, ["/mcp", true]]),
@@ -12,29 +13,53 @@ const routes: Record<string, [string, boolean]> = Object.fromEntries([
 ]);
 // Source tools use the requested version, the checkout pin, or the completed push.
 const pinned = new Set(["build", "test", "run", "language"]);
+
+export function fixedAnalysis(name: string, args: Record<string, unknown>): boolean {
+    return (
+        name === "language" &&
+        [args.view, args.from_view, args.to_view, args.continuation].some(
+            (value) => typeof value === "string" && value.length > 0,
+        )
+    );
+}
+
+export function analysisMetadata(name: string, args: Record<string, unknown>): boolean {
+    return name === "language" && ["schema", "describe", "plan"].includes(String(args.action));
+}
 // The binding decides these, so the agent never sees them.
 const bound = new Set(["project", "worldline"]);
 const instructions =
-    "These tools build, test, run and analyze the project in this directory on a Fughetta core. Edit files on disk with your own tools; changes are sent before source-reading calls unless a version is supplied or the checkout has a pinned version. Build, test, run and language accept a version or @tag; this selection overrides the checkout pin. Files ignored by .gitignore or .fughettaignore are not sent. Tools take no project argument. Start with configurations. When it lists none, or none that fits, read the repository, then use schema, project and save_project to set up builds, tests and analysis. Long calls return their final result and stream progress while running. Cancel a call with notifications/cancelled.";
+    "These tools build, test, run and analyze the project in this directory on a Fughetta core. Edit files on disk with your own tools; changes are sent before source-reading calls unless a version is supplied or the checkout has a pinned version. Build, test, run and language accept a version or @tag; this selection overrides the checkout pin. Language schema, describe and plan calls, plus queries using a view or continuation, skip source synchronization. Files ignored by .gitignore or .fughettaignore are not sent. Tools take no project argument. Answer symbol questions with language instead of searching files or reading whole ones: inspect returns a declaration's signature, its one-hop parameter and result types and its definition; definitions, references and relations follow uses and calls, including across languages. Start with configurations. When it lists none, or none that fits, read the repository, then use schema, project and save_project to set up builds, tests and analysis. Long calls return their final result and stream progress while running. Cancel a call with notifications/cancelled.";
 
 export function unbound(value: unknown): unknown {
-    if (Array.isArray(value)) return value.map(unbound);
-    if (!object(value)) return value;
-    return Object.fromEntries(
-        Object.entries(value).map(([key, item]) => [
-            key,
-            key === "properties" && object(item)
-                ? Object.fromEntries(
-                      Object.entries(item)
-                          .filter(([name]) => !bound.has(name))
-                          .map(([n, v]) => [n, unbound(v)]),
-                  )
-                : key === "required" && Array.isArray(item)
-                  ? item.filter((n) => !bound.has(n))
-                  : unbound(item),
-        ]),
-    );
+    if (!object(value) || !object(value.inputSchema)) return value;
+    const exposed = { ...value, inputSchema: structuredClone(value.inputSchema) };
+    const root = exposed.inputSchema;
+    const visited = new Set<object>();
+    const hide = (schema: unknown): void => {
+        if (!object(schema) || visited.has(schema)) return;
+        visited.add(schema);
+        if (typeof schema.$ref === "string" && schema.$ref.startsWith("#/")) {
+            let target: unknown = root;
+            for (const part of schema.$ref.slice(2).split("/"))
+                target = object(target)
+                    ? target[part.replaceAll("~1", "/").replaceAll("~0", "~")]
+                    : undefined;
+            hide(target);
+        }
+        if (object(schema.properties))
+            schema.properties = Object.fromEntries(
+                Object.entries(schema.properties).filter(([name]) => !bound.has(name)),
+            );
+        if (Array.isArray(schema.required))
+            schema.required = schema.required.filter((name) => !bound.has(String(name)));
+        for (const key of ["allOf", "anyOf", "oneOf"])
+            if (Array.isArray(schema[key])) schema[key].forEach(hide);
+    };
+    hide(root);
+    return exposed;
 }
+
 export function report(p: Pushed, output: (line: string) => void, details = output) {
     for (const path of p.skipped) details(`skipped ${path}`);
     for (const path of p.deferred ?? [])
@@ -127,12 +152,21 @@ export class Proxy {
             if (req.method === "initialize") {
                 this.reply(id, {
                     protocolVersion: "2025-06-18",
-                    capabilities: { tools: { listChanged: false } },
+                    capabilities: {
+                        tools: { listChanged: false },
+                        prompts: { listChanged: false },
+                    },
                     serverInfo: { name: "fughetta", version: "0.1.0" },
                     instructions,
                 });
             } else if (req.method === "ping") this.reply(id, {});
-            else if (req.method === "tools/list") {
+            else if (req.method === "prompts/list") this.reply(id, listed());
+            else if (req.method === "prompts/get") {
+                const p = object(req.params) ? req.params : {};
+                const found = prompted(p.name, p.arguments);
+                if (typeof found === "string") this.fail(id, -32602, found);
+                else this.reply(id, found);
+            } else if (req.method === "tools/list") {
                 this.listing ??= this.tools().catch((error) => {
                     this.listing = undefined;
                     throw error;
@@ -166,13 +200,14 @@ export class Proxy {
                 };
                 this.pending.set(key(id), forwarded);
                 const signal = forwarded.controller.signal;
+                const fixedView = fixedAnalysis(p.name, args);
                 const selection =
                     typeof args.version === "string" && args.version
                         ? args.version
                         : this.binding.version;
                 let synchronized: Pushed | undefined;
                 try {
-                    if (sources && !selection) {
+                    if (sources && !fixedView && !selection && !analysisMetadata(p.name, args)) {
                         const task = this.pushing.then(() => {
                             signal.throwIfAborted();
                             return this.sync({ ...this.core, signal }, this.binding, this.root);
@@ -203,7 +238,7 @@ export class Proxy {
                             return;
                         }
                     }
-                    if (pinned.has(p.name))
+                    if (pinned.has(p.name) && !fixedView)
                         Object.assign(args, {
                             worldline: this.binding.worldline,
                             version: selection ?? synchronized?.version,

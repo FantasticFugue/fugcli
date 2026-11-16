@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdir, writeFile, readFile, rm, chmod, stat, utimes } from "node:fs/promises";
+import { lstat, mkdir, writeFile, readFile, rm, chmod, stat, utimes } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { createServer } from "node:http";
@@ -78,13 +78,14 @@ test(
                 ]),
             );
             assert.match(created, /Created the project demo/);
-            assert.match(created, /Sent 8 new/);
+            assert.match(created, /Sent 9 new/);
             const inspect = () =>
                 worldline(core, { project: "demo", worldline: "main" }, "inspect");
             let tree = await inspect();
             assert.deepEqual(
                 tree.files.map((f) => f.path),
                 [
+                    ".codex/config.toml",
                     ".gitignore",
                     ".mcp.json",
                     "CMakeLists.txt",
@@ -104,7 +105,16 @@ test(
             assert.equal(file(tree, "main.cpp").executable, false);
             assert.equal(file(tree, "logo.bin").kind, "binary");
             const project = await call(core, "GET", "/api/v1/projects/demo");
-            assert.doesNotMatch(project.body, /"debug"/);
+            const generated = JSON.parse(project.body).value;
+            assert.deepEqual(Object.keys(generated.build_configurations), ["debug"]);
+            assert.equal(generated.build_configurations.debug.builders.main.adapter, "cmake");
+            assert.equal(
+                generated.build_configurations.debug.builders.main.options.export_compile_commands,
+                true,
+            );
+            assert.deepEqual(generated.analysis.main.stages.cpp.inputs.compilation_database, [
+                { configuration: "debug", task: "configure", output: "compilation_database" },
+            ]);
             const mcp = JSON.parse(await readFile(join(root, ".mcp.json"), "utf8"));
             assert.ok(mcp.mcpServers.fughetta);
             assert.equal(mcp.mcpServers.fughetta.args.at(-1), "mcp");
@@ -135,7 +145,7 @@ test(
             assert.match(ok(await run(join(root, "src"), home, ["push"])), /Nothing to send/);
             assert.match(
                 ok(await run(join(root, "src"), home, ["status"])),
-                /Build configurations: none/,
+                /Build configurations: debug/,
             );
             // The agent configures the project through the proxy.
             const session = async (name, args) => {
@@ -164,9 +174,9 @@ test(
                 assert.equal(reply.result.isError, false, JSON.stringify(reply));
                 return reply.result.structuredContent;
             };
-            const { revision } = await session("project", {});
-            const debug = {
-                builders: { main: { adapter: "cmake", options: { build_dir: "build/debug" } } },
+            const current = await session("project", {});
+            const release = {
+                builders: { main: { adapter: "cmake", options: { build_dir: "build/release" } } },
                 tasks: {
                     configure: { builder: "main", operation: "configure" },
                     build: { builder: "main", operation: "build", after: ["configure"] },
@@ -175,19 +185,25 @@ test(
             };
             await session("save_project", {
                 body: {
-                    revision,
-                    value: { build_configurations: { debug }, default_configurations: ["debug"] },
+                    revision: current.revision,
+                    value: {
+                        ...current.value,
+                        build_configurations: {
+                            ...current.value.build_configurations,
+                            release,
+                        },
+                    },
                 },
             });
             assert.match(
                 ok(await run(join(root, "src"), home, ["status"])),
-                /Build configurations: debug/,
+                /Build configurations: debug, release/,
             );
             const statusJson = JSON.parse(
                 ok(await run(join(root, "src"), home, ["status", "--json"])),
             );
             assert.equal(statusJson.project, "demo");
-            assert.deepEqual(statusJson.build_configurations, ["debug"]);
+            assert.deepEqual(statusJson.build_configurations, ["debug", "release"]);
             assert.equal(typeof statusJson.cache.total, "number");
             assert.deepEqual(statusJson.pending_recovery, []);
             const pushedJson = JSON.parse(ok(await run(root, home, ["push", "--json"])));
@@ -219,6 +235,13 @@ test(
                         params: { name: "read", arguments: { path: "main.cpp" } },
                     },
                     { id: 6, method: "resources/list" },
+                    { id: 7, method: "prompts/list" },
+                    {
+                        id: 8,
+                        method: "prompts/get",
+                        params: { name: "build", arguments: { configuration: "debug" } },
+                    },
+                    { id: 9, method: "prompts/get", params: { name: "language" } },
                 ]
                     .map((r) => JSON.stringify({ jsonrpc: "2.0", ...r }))
                     .join("\n") + "\n";
@@ -233,7 +256,13 @@ test(
                         return [r.id, r];
                     }),
             );
-            assert.equal(replies.size, 6);
+            assert.equal(replies.size, 9);
+            assert.deepEqual(
+                replies.get(7).result.prompts.map((prompt) => prompt.name),
+                ["sync", "build", "test", "language", "worldline"],
+            );
+            assert.match(replies.get(8).result.messages[0].content.text, /configuration debug/);
+            assert.equal(replies.get(9).error.code, -32602);
             assert.ok(replies.get(1).result.instructions);
             assert.equal(replies.get(1).result.protocolVersion, "2025-06-18");
             const names = replies.get(2).result.tools.map((t) => t.name);
@@ -241,7 +270,17 @@ test(
                 assert.ok(names.includes(n), n);
             for (const n of ["read", "worldline", "write", "save_server"])
                 assert.ok(!names.includes(n), n);
-            assert.ok(!JSON.stringify(replies.get(2)).includes('"project":{'));
+            for (const tool of replies.get(2).result.tools) {
+                const schema = tool.inputSchema ?? {};
+                assert.ok(
+                    !Object.hasOwn(schema.properties ?? {}, "project"),
+                    `${tool.name} binds the project itself`,
+                );
+                assert.ok(
+                    !(schema.required ?? []).includes("project"),
+                    `${tool.name} binds the project itself`,
+                );
+            }
             assert.deepEqual(replies.get(3).result, {});
             assert.equal(replies.get(4).result.isError, false);
             assert.match(JSON.stringify(replies.get(4)), /"name":"debug"/);
@@ -256,19 +295,18 @@ test(
                 ".mcp.json",
                 JSON.stringify({ custom: true, mcpServers: { other: { command: "other" } } }),
             );
-            await mkdir(join(root, ".cursor"));
-            assert.match(
-                ok(await run(root, home, ["init", "--server", service.origin])),
-                /Using the existing project demo/,
-            );
+            const repeated = ok(await run(root, home, ["init", "--server", service.origin]));
+            assert.match(repeated, /Using the existing project demo/);
+            assert.match(repeated, /Kept the project's existing build configurations/);
+            // Beyond its own directory, init leaves two registrations and nothing else in the project.
+            const codex = await readFile(join(root, ".codex/config.toml"), "utf8");
+            assert.equal(codex.match(/\[mcp_servers\.fughetta\]/g)?.length, 1);
+            for (const absent of [".fughettaignore", ".claude", ".cursor", ".pi", ".agents"])
+                await assert.rejects(lstat(join(root, absent)), { code: "ENOENT" }, absent);
             const updated = JSON.parse(await readFile(join(root, ".mcp.json"), "utf8"));
             assert.equal(updated.custom, true);
             assert.equal(updated.mcpServers.other.command, "other");
             assert.ok(updated.mcpServers.fughetta);
-            assert.ok(
-                JSON.parse(await readFile(join(root, ".cursor/mcp.json"), "utf8")).mcpServers
-                    .fughetta,
-            );
             await put(".mcp.json", "{invalid");
             assert.match(
                 ok(await run(root, home, ["init", "--server", service.origin])),
@@ -504,6 +542,146 @@ test("status, resolve and clean inspect local state without a server", async () 
     }
 });
 
+test("language selects profile outputs, resumes partial results and pages the returned view", async () => {
+    const root = await scratch("cli-continuation");
+    const requests = [];
+    const continuation = JSON.stringify({
+        view: "view-original",
+        cursor: "retained-query",
+    });
+    const host = createServer(async (req, res) => {
+        let text = "";
+        for await (const part of req) text += part;
+        const input = JSON.parse(text);
+        requests.push(input.params?.arguments);
+        const args = input.params?.arguments ?? {};
+        const result =
+            args.action === "plan"
+                ? {
+                      plan: {
+                          stages: ["main", "mirror"],
+                          outputs: { combined: [{ stage: "mirror", output: "facts" }] },
+                      },
+                  }
+                : args.continuation
+                  ? {
+                        status: "complete",
+                        view: "view-next",
+                        next_view: "view-next",
+                        cursor: "page-next",
+                    }
+                  : args.cursor
+                    ? { status: "complete", view: "view-next" }
+                    : {
+                          status: "partial",
+                          view: "view-original",
+                          continuation,
+                          coverage: {
+                              missing: [
+                                  {
+                                      reason: "the view was prepared for selected files",
+                                      scope: { files: ["other file.cpp"] },
+                                  },
+                              ],
+                          },
+                      };
+        res.writeHead(200, { "content-type": "application/json" }).end(
+            JSON.stringify({
+                jsonrpc: "2.0",
+                id: input.id,
+                result: { isError: false, structuredContent: result, content: [] },
+            }),
+        );
+    });
+    await new Promise((done) => host.listen(0, "127.0.0.1", done));
+    try {
+        await mkdir(join(root, ".fughetta"));
+        await writeFile(
+            join(root, ".fughetta/project.json"),
+            JSON.stringify({
+                server: `http://127.0.0.1:${host.address().port}`,
+                workspace: "",
+                project: "demo",
+                worldline: "current",
+            }),
+        );
+        const query = (args) =>
+            run(root, root, ["language", ...args], "", { FUGHETTA_TOKEN: "test-token" });
+        const plan = JSON.parse(
+            ok(
+                await query([
+                    "plan",
+                    "--configuration",
+                    "paired",
+                    "--outputs",
+                    "primary, combined",
+                    "--json",
+                ]),
+            ),
+        );
+        assert.deepEqual(plan.plan.stages, ["main", "mirror"]);
+        assert.deepEqual(requests.at(-1), {
+            action: "plan",
+            configuration: "paired",
+            outputs: ["primary", "combined"],
+            project: "demo",
+            worldline: "current",
+        });
+        const partial = ok(await query(["symbols", "--view", "view-original"]));
+        assert.match(partial, /Missing:.*other file.cpp/);
+        const token = JSON.parse(partial.trim().split("\n").at(-1));
+        assert.equal(token, continuation);
+        const resumed = JSON.parse(
+            ok(
+                await query([
+                    "--continuation",
+                    token,
+                    "--budget-nodes",
+                    "4000",
+                    "--budget-units",
+                    "2",
+                    "--budget-ms",
+                    "500",
+                    "--json",
+                ]),
+            ),
+        );
+        assert.equal(resumed.next_view, "view-next");
+        assert.deepEqual(requests.at(-1), {
+            project: "demo",
+            continuation,
+            budget: { nodes: 4000, units: 2, milliseconds: 500 },
+        });
+        const page = JSON.parse(
+            ok(
+                await query([
+                    "symbols",
+                    "--view",
+                    resumed.view,
+                    "--cursor",
+                    resumed.cursor,
+                    "--limit",
+                    "1",
+                    "--json",
+                ]),
+            ),
+        );
+        assert.equal(page.view, "view-next");
+        assert.deepEqual(requests.at(-1), {
+            project: "demo",
+            action: "symbols",
+            view: "view-next",
+            cursor: "page-next",
+            limit: 1,
+        });
+        assert.equal(requests.length, 4);
+    } finally {
+        host.closeAllConnections();
+        await new Promise((done) => host.close(done));
+        await rm(root, { recursive: true, force: true });
+    }
+});
+
 test("language argument validation", async () => {
     const dir = await scratch("cli-language");
     try {
@@ -513,11 +691,11 @@ test("language argument validation", async () => {
         );
         assert.match(
             (await run(dir, dir, ["language", "definitions"])).stderr,
-            /needs --path and --symbol/,
+            /needs --symbol or --entity/,
         );
         assert.match(
             (await run(dir, dir, ["language", "--line", "0"])).stderr,
-            /--line must be a positive integer/,
+            /Unknown option --line/,
         );
         assert.match(
             (await run(dir, dir, ["language", "symbols", "extra"])).stderr,
@@ -526,6 +704,15 @@ test("language argument validation", async () => {
         assert.match(
             (await run(dir, dir, ["language", "--json", "--json"])).stderr,
             /not bound|no token/i,
+        );
+        assert.match(
+            (await run(dir, dir, ["language", "--continuation", "token", "--view", "view-1"]))
+                .stderr,
+            /token selects the query and view/,
+        );
+        assert.match(
+            (await run(dir, dir, ["language", "--budget-units", "-1"])).stderr,
+            /must be a nonnegative safe integer/,
         );
     } finally {
         await rm(dir, { recursive: true, force: true });

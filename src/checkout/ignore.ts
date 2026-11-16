@@ -1,10 +1,14 @@
-// Which paths of a checkout are not sent: .gitignore and .fughettaignore files at every level, with gitignore semantics, plus
-// version control data, this checkout's own directory and installed packages, which no file can bring back.
+// Which paths of a checkout are not sent: .gitignore and .fughettaignore files at every level, with gitignore semantics, the
+// rules `fug init` keeps in .fughetta/ignore for the root, plus version control data, this checkout's own directory and
+// installed packages, which no file can bring back.
 import ignore, { type Ignore } from "ignore";
 import { lstat, readFile } from "node:fs/promises";
 import { join } from "node:path";
 
 const never = new Set([".git", ".hg", ".jj", ".svn", "node_modules"]);
+
+// Where `fug init` records the generated directories it detects, so that it never edits the project's own ignore files.
+export const generated = ".fughetta/ignore";
 
 // Git matches without case where the file system usually ignores it.
 const ignorecase = process.platform !== "linux";
@@ -26,7 +30,7 @@ export class Rules {
     // Git, an ignore file that is a link is not followed.
     async enter(dir: string, relative: string): Promise<Rules> {
         let rules: Ignore | undefined;
-        for (const name of [".gitignore", ".fughettaignore"]) {
+        for (const name of [".gitignore", ".fughettaignore", ...(relative ? [] : [generated])]) {
             const path = join(dir, name);
             try {
                 if (!(await lstat(path)).isFile()) continue;

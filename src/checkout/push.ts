@@ -34,6 +34,27 @@ export interface Pushed {
     updated?: string[];
 }
 export const changed = (p: Pushed) => p.created + p.written + p.removed > 0;
+// The file contents this process last sent or received, by digest, so that comparing an edited file with the text it started
+// from costs no remote read. The most recently used stay within the limit; nothing is written to disk.
+const recent = { file: 1 << 20, limit: 8 << 20, size: 0, items: new Map<string, Buffer>() };
+function recall(digest: string): Buffer | undefined {
+    const bytes = recent.items.get(digest);
+    if (bytes) {
+        recent.items.delete(digest);
+        recent.items.set(digest, bytes);
+    }
+    return bytes;
+}
+function retain(digest: string, bytes: Buffer) {
+    if (bytes.length > recent.file || recent.items.has(digest)) return;
+    recent.items.set(digest, bytes);
+    recent.size += bytes.length;
+    for (const [oldest, dropped] of recent.items) {
+        if (recent.size <= recent.limit) break;
+        recent.items.delete(oldest);
+        recent.size -= dropped.length;
+    }
+}
 interface Entry {
     digest: string;
     kind: string;
@@ -237,6 +258,7 @@ async function tree(core: Connection, binding: Binding): Promise<Tree> {
 
 class Ledger {
     constructor(
+        readonly root: string,
         readonly path: string,
         readonly state: State,
         readonly core: Connection,
@@ -244,36 +266,42 @@ class Ledger {
     readonly preserved: string[] = [];
     readonly blocked = new Set<string>();
     rescan = false;
-    private cached = new Set<string>();
+    private memo = new Map<string, Buffer>();
     private journals = new Map<string, Pull>();
     private metadata(value: unknown): unknown {
         return JSON.parse(
             JSON.stringify(value, (key, item) => (key === "data_base64" ? undefined : item)),
         );
     }
+    private keep(digest: string, bytes: Buffer): Buffer {
+        this.memo.set(digest, bytes);
+        retain(digest, bytes);
+        return bytes;
+    }
+    // A baseline's bytes are those this process last handled for the digest, else the working tree's while it still has the
+    // recorded digest, and otherwise the worldline version recorded for its path.
     async bytes(file: Entry): Promise<Buffer> {
-        let bytes: Buffer | undefined;
-        try {
-            bytes =
-                file.data_base64 === undefined
-                    ? await readFile(join(dirname(this.path), "blobs", file.digest))
-                    : Buffer.from(file.data_base64, "base64");
-        } catch (error) {
-            if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        const known = this.memo.get(file.digest) ?? recall(file.digest);
+        if (known) return known;
+        if (file.data_base64 !== undefined) {
+            const bytes = Buffer.from(file.data_base64, "base64");
+            if (bytes.length !== file.size || digestOf(bytes) !== file.digest)
+                throw new Error(`Source content verification failed for ${file.digest}`);
+            return this.keep(file.digest, bytes);
         }
-        if (bytes && bytes.length === file.size && digestOf(bytes) === file.digest) return bytes;
         const baseline = Object.entries(this.state.files).find(
             ([, item]) => item.file?.digest === file.digest,
         );
         if (!baseline)
             throw new Error(
-                "Cached source content failed verification and has no saved source version",
+                `Source content ${file.digest} has no saved source version in this checkout`,
             );
         const [path, item] = baseline;
+        const local = await readFile(join(this.root, path)).catch(() => undefined);
+        if (local && local.length === file.size && digestOf(local) === file.digest)
+            return this.keep(file.digest, local);
         const restored = await remoteFile(this.core, this.state.binding, item.version, path, file);
-        this.cached.delete(file.digest);
-        await this.cache(restored);
-        return Buffer.from(restored.data_base64!, "base64");
+        return this.keep(file.digest, Buffer.from(restored.data_base64!, "base64"));
     }
     async collectRecovered(root: string) {
         const directory = join(dirname(this.path), "recovered");
@@ -304,28 +332,10 @@ class Ledger {
             } else this.preserved.push(backup);
         }
     }
-    private async cache(file?: Entry | null) {
-        if (!file || file.data_base64 === undefined || this.cached.has(file.digest)) return;
-        const directory = join(dirname(this.path), "blobs");
-        await mkdir(directory, { recursive: true });
-        const target = join(directory, file.digest);
-        const temp = `${target}.${randomUUID()}`;
-        try {
-            await writeFile(temp, await this.bytes(file), { flag: "wx", mode: 0o600 });
-            await rename(temp, target);
-        } finally {
-            await rm(temp, { force: true });
-        }
-        this.cached.add(file.digest);
-    }
     async save() {
-        for (const item of Object.values(this.state.files)) await this.cache(item.file);
-        for (const file of Object.values(this.state.pending?.after ?? {})) await this.cache(file);
         await save(this.path, this.metadata(this.state));
     }
     async journal(pull: Pull): Promise<string> {
-        await this.cache(pull.before);
-        await this.cache(pull.after);
         const file = join(dirname(this.path), "pulls", `${randomUUID()}.json`);
         await save(file, this.metadata(pull));
         this.journals.set(file, pull);
@@ -335,19 +345,6 @@ class Ledger {
         await this.save();
         for (const file of [...this.journals.keys()]) await this.cancelJournal(file);
         this.journals.clear();
-        const keep = new Set(
-            Object.values(this.state.files).flatMap((item) =>
-                item.file ? [item.file.digest] : [],
-            ),
-        );
-        for (const file of Object.values(this.state.pending?.after ?? {}))
-            if (file) keep.add(file.digest);
-        const directory = join(dirname(this.path), "blobs");
-        for (const name of await readdir(directory).catch((error) => {
-            if ((error as NodeJS.ErrnoException).code === "ENOENT") return [] as string[];
-            throw error;
-        }))
-            if (!keep.has(name)) await rm(join(directory, name), { force: true });
     }
     async installed(file: string) {
         const pull = this.journals.get(file)!;
@@ -506,9 +503,11 @@ async function open(
         throw new Error(
             "This directory has a baseline for another binding; use fug worldline checkout in a new directory",
         );
+    // A checkout that once kept a duplicate source copy must not retain the dead weight.
+    await rm(join(stateDir(root), "blobs"), { recursive: true, force: true });
     if (stored && sameBinding(stored.binding, binding)) {
         stored.files = Object.assign(Object.create(null), stored.files);
-        const ledger = new Ledger(path, stored, core);
+        const ledger = new Ledger(root, path, stored, core);
         await ledger.collectRecovered(root);
         await ledger.settle(core);
         await ledger.recoverPull(root);
@@ -530,7 +529,7 @@ async function open(
     )) {
         if (value) state.files[file.path] = { version: remote.version, file: value };
     }
-    const ledger = new Ledger(path, state, core);
+    const ledger = new Ledger(root, path, state, core);
     await ledger.save();
     return ledger;
 }
@@ -542,8 +541,18 @@ async function edits(
 ): Promise<Edit[]> {
     const state = ledger.state;
     const out: Edit[] = [];
-    for (const path of new Set([...Object.keys(state.files), ...local.keys()])) {
-        if (shadowed(skipped, path)) continue;
+    const paths = [...new Set([...Object.keys(state.files), ...local.keys()])].filter(
+        (path) => !shadowed(skipped, path),
+    );
+    // A changed text file is compared against its baseline, whose bytes the working
+    // tree may no longer hold. Fetch every old side together before planning edits.
+    const oldText = paths.filter((path) => {
+        const a = state.files[path]?.file,
+            b = local.get(path);
+        return a?.kind === "text" && b?.kind === "text" && a.digest !== b.digest;
+    });
+    for await (const _ of prefetch(oldText, (path) => decode(ledger, state.files[path]!.file!)));
+    for (const path of paths) {
         const before = state.files[path],
             a = before?.file,
             b = local.get(path),
