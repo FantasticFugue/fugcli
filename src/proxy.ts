@@ -1,37 +1,29 @@
+import { type JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
+import { deserializeMessage, serializeMessage } from "@modelcontextprotocol/sdk/shared/stdio.js";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
-import { type Connection, rpc, call, responseError } from "./remote.js";
-import { type Binding, type Pushed, push, changed, stateDir } from "./checkout/index.js";
+import { type Connection, rpc } from "./remote.js";
+import { type Binding, type Pushed, push, stateDir } from "./checkout/index.js";
 import { object, save } from "./files.js";
-import { localReports, localExports, reportSchema } from "./delivery.js";
+import { reportSchema } from "./delivery.js";
 import { listed, prompted } from "./prompts.js";
+import {
+    callTool,
+    cancelToolCall,
+    deliversFiles,
+    planToolCall,
+    report,
+    routes,
+    toolRequest,
+} from "./tool-call.js";
 
-const routes: Record<string, [string, boolean]> = Object.fromEntries([
-    ...["configurations", "build", "test", "run", "language"].map((n) => [n, ["/mcp", true]]),
-    ...["project", "save_project", "effective", "schema"].map((n) => [n, ["/mcp/config", false]]),
-]);
-// Source tools use the requested version, the checkout pin, or the completed push.
-const pinned = new Set(["build", "test", "run", "language"]);
-
-export function fixedAnalysis(name: string, args: Record<string, unknown>): boolean {
-    return (
-        name === "language" &&
-        [args.view, args.from_view, args.to_view, args.continuation].some(
-            (value) => typeof value === "string" && value.length > 0,
-        )
-    );
-}
-
-export function analysisMetadata(name: string, args: Record<string, unknown>): boolean {
-    return name === "language" && ["schema", "describe", "plan"].includes(String(args.action));
-}
 // The binding decides these, so the agent never sees them.
 const bound = new Set(["project", "worldline"]);
 const instructions =
-    "These tools build, test, run and analyze the project in this directory on a Fughetta core. Edit files on disk with your own tools; changes are sent before source-reading calls unless a version is supplied or the checkout has a pinned version. Build, test, run and language accept a version or @tag; this selection overrides the checkout pin. Language schema, describe and plan calls, plus queries using a view or continuation, skip source synchronization. Files ignored by .gitignore or .fughettaignore are not sent. Tools take no project argument. Answer symbol questions with language instead of searching files or reading whole ones: inspect returns a declaration's signature, its one-hop parameter and result types and its definition; definitions, references and relations follow uses and calls, including across languages. Start with configurations. When it lists none, or none that fits, read the repository, then use schema, project and save_project to set up builds, tests and analysis. Long calls return their final result and stream progress while running. Cancel a call with notifications/cancelled.";
+    "These tools build, test, run and analyze the project in this directory on a Fughetta core. Edit files on disk with your own tools; changes are sent before source-reading calls unless a version is supplied or the checkout has a pinned version. Build, test, run and language accept a version or @tag; this selection overrides the checkout pin. Language schema, describe and plan calls, plus queries using a view or continuation, skip source synchronization. Files ignored by .gitignore or .fughettaignore are not sent. Tools take no project argument. Answer symbol questions with language instead of searching files or reading whole ones: inspect returns a declaration's signature, its one-hop parameter and result types and its definition; definitions, references and relations follow uses and calls, including across languages. An unconfigured inspect returns a syntax outline. Use a file scope or name selector to narrow it. Start with configurations for build and test commands. Use schema, project and save_project when the project needs build graphs or semantic analysis. Long calls return their final result and stream progress while running. Cancel a call with notifications/cancelled.";
 
-export function unbound(value: unknown): unknown {
+function unbound(value: unknown): unknown {
     if (!object(value) || !object(value.inputSchema)) return value;
     const exposed = { ...value, inputSchema: structuredClone(value.inputSchema) };
     const root = exposed.inputSchema;
@@ -60,29 +52,10 @@ export function unbound(value: unknown): unknown {
     return exposed;
 }
 
-export function report(p: Pushed, output: (line: string) => void, details = output) {
-    for (const path of p.skipped) details(`skipped ${path}`);
-    for (const path of p.deferred ?? [])
-        details(
-            `deferred ${path}; review the synchronization details above and run fug push again`,
-        );
-    for (const path of p.kept) details(`kept ${path}`);
-    for (const path of p.preserved ?? []) details(`preserved content at ${path}`);
-    for (const conflict of p.conflicts ?? []) details(`source conflict ${conflict}`);
-    output(
-        changed(p)
-            ? `Sent ${p.created} new, ${p.written} changed and ${p.removed} removed files; the project is at version ${p.version}`
-            : `Nothing to send; the project is at version ${p.version}`,
-    );
-}
-
 export class Proxy {
     private listing?: Promise<unknown[]>;
     private pushing: Promise<unknown> = Promise.resolve();
-    private pending = new Map<
-        string,
-        { path: string; id: string; controller: AbortController; sent: boolean }
-    >();
+    private pending = new Map<string, ReturnType<typeof toolRequest>>();
     constructor(
         private core: Connection,
         private binding: Binding,
@@ -97,39 +70,28 @@ export class Proxy {
     private fail(id: string | number | null, code: number, message: string) {
         this.send({ jsonrpc: "2.0", id, error: { code, message } });
     }
-    private async cancel(target: { path: string; id: string }) {
+    private async cancel(target: ReturnType<typeof toolRequest>) {
         try {
-            const r = await call(
-                this.core,
-                "POST",
-                target.path,
-                {
-                    jsonrpc: "2.0",
-                    method: "notifications/cancelled",
-                    params: { requestId: target.id },
-                },
-                3_000,
-            );
-            if (r.status !== 202 && r.status !== 200) throw responseError(r);
+            await cancelToolCall(this.core, target);
         } catch (error) {
             this.stderr(`fug: cancel: ${String(error)}`);
         }
     }
     async line(line: string): Promise<void> {
         if (!line.trim()) return;
-        let req;
+        let req: JSONRPCMessage;
         try {
-            req = JSON.parse(line);
-        } catch {
-            this.fail(null, -32700, "Invalid JSON");
+            req = deserializeMessage(line);
+        } catch (error) {
+            const invalid = !(error instanceof SyntaxError);
+            this.fail(
+                null,
+                invalid ? -32600 : -32700,
+                invalid ? "Invalid request" : "Invalid JSON",
+            );
             return;
         }
-        if (
-            !object(req) ||
-            req.jsonrpc !== "2.0" ||
-            typeof req.method !== "string" ||
-            ("id" in req && !(typeof req.id === "string" || Number.isSafeInteger(req.id)))
-        ) {
+        if (!("method" in req)) {
             this.fail(null, -32600, "Invalid request");
             return;
         }
@@ -146,7 +108,6 @@ export class Proxy {
             return;
         }
         if (!("id" in req)) return;
-        // Number.isSafeInteger above accepts numeric IDs without narrowing their type.
         const id = req.id as string | number;
         try {
             if (req.method === "initialize") {
@@ -182,32 +143,21 @@ export class Proxy {
                     this.fail(id, -32602, "Tool params need a name and object arguments");
                     return;
                 }
-                const route = Object.hasOwn(routes, p.name) ? routes[p.name] : undefined;
-                if (!route) {
+                if (!Object.hasOwn(routes, p.name)) {
                     this.fail(id, -32602, `unknown tool: ${p.name}`);
                     return;
                 }
-                const [path, sources] = route;
-                const args: Record<string, unknown> = {
-                    ...(p.arguments as Record<string, unknown> | undefined),
-                    project: this.binding.project,
-                };
-                const forwarded = {
-                    path,
-                    id: `fug-${randomUUID()}`,
-                    controller: new AbortController(),
-                    sent: false,
-                };
-                this.pending.set(key(id), forwarded);
+                const plan = planToolCall(
+                    this.binding,
+                    p.name,
+                    (p.arguments ?? {}) as Record<string, unknown>,
+                );
+                const forwarded = toolRequest(plan.path);
                 const signal = forwarded.controller.signal;
-                const fixedView = fixedAnalysis(p.name, args);
-                const selection =
-                    typeof args.version === "string" && args.version
-                        ? args.version
-                        : this.binding.version;
+                this.pending.set(key(id), forwarded);
                 let synchronized: Pushed | undefined;
                 try {
-                    if (sources && !fixedView && !selection && !analysisMetadata(p.name, args)) {
+                    if (plan.synchronize) {
                         const task = this.pushing.then(() => {
                             signal.throwIfAborted();
                             return this.sync({ ...this.core, signal }, this.binding, this.root);
@@ -238,68 +188,26 @@ export class Proxy {
                             return;
                         }
                     }
-                    if (pinned.has(p.name) && !fixedView)
-                        Object.assign(args, {
-                            worldline: this.binding.worldline,
-                            version: selection ?? synchronized?.version,
-                        });
-                    signal.throwIfAborted();
-                    const progressToken = randomUUID();
                     let progress = 0;
-                    forwarded.sent = true;
-                    const reply = await rpc(
-                        { ...this.core, signal },
-                        path,
-                        {
-                            jsonrpc: "2.0",
-                            id: forwarded.id,
-                            method: "tools/call",
-                            params: {
-                                ...p,
-                                arguments: args,
-                                _meta: {
-                                    ...(p._meta as Record<string, unknown> | undefined),
-                                    progressToken,
-                                    "fughetta/client_sync_seconds":
-                                        synchronized?.client_sync_seconds,
-                                },
-                            },
-                        },
+                    const reply = await callTool(
+                        this.core,
+                        this.binding,
+                        this.root,
+                        forwarded,
+                        { ...p, name: p.name, arguments: plan.arguments(synchronized) },
+                        synchronized,
                         60_000,
-                        (notification) => {
-                            if (
-                                !object(notification) ||
-                                !object(notification.params) ||
-                                notification.params.progressToken !== progressToken ||
-                                (p._meta as { progressToken?: unknown } | undefined)
-                                    ?.progressToken === undefined
-                            )
-                                return;
-                            const { total: _total, ...params } = notification.params;
+                        (notification, params) => {
+                            const token = (p._meta as { progressToken?: unknown } | undefined)
+                                ?.progressToken;
+                            if (token === undefined) return;
+                            const { total: _total, ...rest } = params;
                             this.send({
                                 ...notification,
-                                params: {
-                                    ...params,
-                                    progress: ++progress,
-                                    progressToken: (p._meta as { progressToken: unknown })
-                                        .progressToken,
-                                },
+                                params: { ...rest, progress: ++progress, progressToken: token },
                             });
                         },
                     );
-                    if (!object(reply) || (!("result" in reply) && !("error" in reply)))
-                        throw new Error("The core sent an invalid MCP reply");
-                    forwarded.sent = false;
-                    if (["build", "test", "run"].includes(p.name) && object(reply.result)) {
-                        await localExports(
-                            { ...this.core, signal },
-                            this.binding.project,
-                            this.root,
-                            reply.result,
-                        );
-                        signal.throwIfAborted();
-                        await localReports(this.root, reply.result);
-                    }
                     if (synchronized) {
                         const { version, created, written, removed } = synchronized;
                         const synchronization: Record<string, unknown> = {
@@ -377,7 +285,7 @@ export class Proxy {
             for (const tool of (reply.result as { tools: { name: string }[] }).tools)
                 if (Object.hasOwn(routes, tool.name) && routes[tool.name]?.[0] === path) {
                     const exposed = unbound(tool) as Record<string, unknown>;
-                    if (["build", "test", "run"].includes(tool.name) && exposed.outputSchema)
+                    if (deliversFiles(tool.name) && exposed.outputSchema)
                         exposed.outputSchema = reportSchema(exposed.outputSchema);
                     out.push(exposed);
                 }
@@ -387,7 +295,7 @@ export class Proxy {
 }
 export async function serve(core: Connection, binding: Binding, root: string) {
     const proxy = new Proxy(core, binding, root, (reply) =>
-        process.stdout.write(JSON.stringify(reply) + "\n"),
+        process.stdout.write(serializeMessage(reply as JSONRPCMessage)),
     );
     const pending = new Set<Promise<void>>();
     for await (const line of createInterface({ input: process.stdin, crlfDelay: Infinity })) {

@@ -1,13 +1,11 @@
 // `fug build`, `fug test`, `fug run` and `fug language`: sync the checkout, call
 // the tool on the core with a progress token and print each stage as it arrives.
-import { randomUUID } from "node:crypto";
-import { type Connection, call, rpc, rpcError, Refused } from "./remote.js";
+import { type Connection, rpcError, Refused } from "./remote.js";
 import { type Binding, push } from "./checkout/index.js";
-import { localExports, localReports } from "./delivery.js";
 import { object } from "./files.js";
-import { analysisMetadata, fixedAnalysis, report } from "./proxy.js";
+import { callTool, cancelToolCall, planToolCall, report, toolRequest } from "./tool-call.js";
 
-export interface Outcome {
+interface Outcome {
     result: Record<string, unknown>;
     ok: boolean;
     cancelled?: boolean;
@@ -22,72 +20,36 @@ export async function execute(
     note: (line: string) => void,
     sync: typeof push = push,
 ): Promise<Outcome> {
-    const fixedView = fixedAnalysis(tool, args);
-    let version = typeof args.version === "string" && args.version ? args.version : binding.version;
-    let syncSeconds: number | undefined;
-    if (!fixedView && !version && !analysisMetadata(tool, args)) {
-        const sent = await sync(core, binding, root);
-        report(sent, note);
-        version = sent.version;
-        syncSeconds = sent.client_sync_seconds;
-    }
-    const id = `fug-${randomUUID()}`,
-        progressToken = randomUUID();
-    const controller = new AbortController();
-    let interrupted = false;
+    const plan = planToolCall(binding, tool, args);
+    const request = toolRequest(plan.path);
+    const signal = request.controller.signal;
     const interrupt = () => {
-        interrupted = true;
-        controller.abort();
-        void call(
-            core,
-            "POST",
-            "/mcp",
-            { jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: id } },
-            3_000,
-        ).catch(() => {});
+        request.controller.abort();
+        void cancelToolCall(core, request).catch(() => {});
     };
     process.once("SIGINT", interrupt);
     let stage = "";
     try {
-        const reply = await rpc(
-            { ...core, signal: controller.signal },
-            "/mcp",
-            {
-                jsonrpc: "2.0",
-                id,
-                method: "tools/call",
-                params: {
-                    name: tool,
-                    _meta: {
-                        progressToken,
-                        ...(syncSeconds === undefined
-                            ? {}
-                            : { "fughetta/client_sync_seconds": syncSeconds }),
-                    },
-                    arguments: {
-                        ...args,
-                        project: binding.project,
-                        ...(fixedView ? {} : { worldline: binding.worldline, version }),
-                    },
-                },
-            },
+        const synchronized = plan.synchronize
+            ? await sync({ ...core, signal }, binding, root)
+            : undefined;
+        if (synchronized) report(synchronized, note);
+        const reply = await callTool(
+            core,
+            binding,
+            root,
+            request,
+            { name: tool, arguments: plan.arguments(synchronized) },
+            synchronized,
             600_000,
-            (value) => {
-                if (
-                    !object(value) ||
-                    !object(value.params) ||
-                    value.params.progressToken !== progressToken
-                )
-                    return;
-                const message = value.params.message;
+            (_, params) => {
+                const message = params.message;
                 if (typeof message === "string" && message && message !== stage) {
                     stage = message;
                     note(`${tool}: ${message}`);
                 }
             },
         );
-        if (!object(reply))
-            throw new Refused("invalid_response", "The core sent an invalid MCP reply");
         if (reply.error) throw rpcError(reply.error);
         if (!object(reply.result))
             throw new Refused("invalid_response", "The core sent no MCP result");
@@ -100,15 +62,6 @@ export async function execute(
                 reply.result.structuredContent.code,
                 String(reply.result.structuredContent.message ?? "The tool refused the call"),
             );
-        if (["build", "test", "run"].includes(tool)) {
-            await localExports(
-                { ...core, signal: controller.signal },
-                binding.project,
-                root,
-                reply.result,
-            );
-            await localReports(root, reply.result);
-        }
         const structured = object(reply.result.structuredContent)
             ? reply.result.structuredContent
             : undefined;
@@ -120,7 +73,7 @@ export async function execute(
             tool === "language" && ["failed", "expired"].includes(String(structured?.status));
         return { result: reply.result, ok: ok && !queryFailed };
     } catch (error) {
-        if (interrupted) return { result: {}, ok: false, cancelled: true };
+        if (signal.aborted) return { result: {}, ok: false, cancelled: true };
         throw error;
     } finally {
         process.off("SIGINT", interrupt);
@@ -268,6 +221,16 @@ export function formatLanguage(result: Record<string, unknown>): string[] {
         }
         return lines;
     }
+    if (Array.isArray(structured.outline)) {
+        lines.push(`Syntax outline on ${String(structured.worldline)} at ${String(structured.version)}`);
+        for (const entry of structured.outline)
+            if (object(entry) && object(entry.source))
+                lines.push(
+                    `${String(entry.kind)} ${String(entry.name)} at ${String(entry.source.path)} [${String(entry.source.begin)}, ${String(entry.source.end)})`,
+                );
+        if (typeof structured.message === "string") lines.push(structured.message);
+        return lines;
+    }
     lines.push(
         `${String(structured.configuration ?? "?")} on ${String(structured.worldline ?? "?")} at ${String(structured.version ?? "?")}` +
             `${structured.stale === true ? " (stale analysis)" : ""}`,
@@ -307,8 +270,11 @@ export function formatLanguage(result: Record<string, unknown>): string[] {
             const details = [scope.files, scope.contexts, scope.facts].flatMap((values) =>
                 Array.isArray(values) ? values : [],
             );
+            const preview = details.slice(0, 4);
+            if (details.length > preview.length)
+                preview.push(`+${details.length - preview.length} more`);
             lines.push(
-                `Missing: ${String(missing.reason ?? "analysis incomplete")}${details.length ? ` (${details.join(", ")})` : ""}`,
+                `Missing: ${String(missing.reason ?? "analysis incomplete")}${preview.length ? ` (${preview.join(", ")})` : ""}`,
             );
         }
     if (Array.isArray(structured.items) && structured.items.length) {
@@ -381,7 +347,8 @@ export function formatLanguage(result: Record<string, unknown>): string[] {
         for (const item of structured.items) {
             if (!object(item)) continue;
             lines.push(
-                `${String(item.name)} (${String(item.kind)})  ${String(item.symbol_id)}${item.type_id ? `  ${typeName(item.type_id)}` : ""}`,
+                `${String(item.name)} (${String(item.kind)})  ${String(item.symbol_id)}${item.type_id ? `  ${typeName(item.type_id)}` : ""}` +
+                    (item.type_confidence === "tentative" ? " [tentative type]" : ""),
             );
             lines.push(
                 `  Context: ${String(item.context ?? "?")}  Module: ${String(item.module ?? "?")}`,
@@ -486,6 +453,41 @@ export function formatLanguage(result: Record<string, unknown>): string[] {
             lines.push(
                 `${Array.isArray(change.kinds) ? change.kinds.join("/") : "change"}: ${String(change.subject.symbol_id)} [${String(change.subject.context)}]`,
             );
+        }
+        for (const match of Array.isArray(comparison.duplicate_types)
+            ? comparison.duplicate_types
+            : []) {
+            if (!object(match) || !object(match.subject) || !object(match.existing)) continue;
+            lines.push(
+                `Duplicate type shape: ${String(match.subject_name ?? match.subject.symbol_id)} can reuse ${String(match.existing_name ?? match.existing.symbol_id)} [${String(match.existing.symbol_id)}]`,
+            );
+        }
+        for (const warning of Array.isArray(comparison.topology) ? comparison.topology : []) {
+            if (!object(warning) || !Array.isArray(warning.modules)) continue;
+            const modules = warning.modules
+                .filter(object)
+                .map((module) => `${String(module.project)}/${String(module.file ?? module.name)}`);
+            if (warning.kind === "cycle") lines.push(`Dependency cycle: ${modules.join(", ")}`);
+            if (warning.kind === "fan_out")
+                lines.push(
+                    `Dependency fan-out: ${modules[0]} (${String(warning.before)} → ${String(warning.after)})`,
+                );
+        }
+        for (const change of Array.isArray(comparison.degraded_types)
+            ? comparison.degraded_types
+            : []) {
+            if (!object(change)) continue;
+            if (change.kind === "unsafe_cast")
+                lines.push(`Unsafe cast in ${String(change.name)} (${String(change.after)})`);
+            else {
+                const slot =
+                    change.kind === "parameter"
+                        ? `parameter ${Number(change.group) + 1}.${Number(change.index) + 1}`
+                        : "return value";
+                lines.push(
+                    `Type degradation in ${String(change.name)} (${slot}): ${String(change.before)} → ${String(change.after)}`,
+                );
+            }
         }
     }
     for (const change of comparison && Array.isArray(comparison.reanalysis)

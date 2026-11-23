@@ -1,3 +1,4 @@
+import { parseArguments } from "./arguments.js";
 // Text records between worldlines or named recipients, independent of source merging.
 import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
@@ -27,18 +28,6 @@ interface Draft {
     body: string;
 }
 
-function options(args: string[], allowed: string[]): Record<string, string> {
-    const out: Record<string, string> = {};
-    for (let i = 0; i < args.length; i += 2) {
-        const flag = args[i]!;
-        if (!allowed.includes(flag) || !args[i + 1])
-            throw new Refused("invalid_params", `Invalid d-mail option ${flag}`);
-        if (out[flag] !== undefined) throw new Refused("invalid_params", `Repeated option ${flag}`);
-        out[flag] = args[i + 1]!;
-    }
-    return out;
-}
-
 export async function mail(
     core: Connection,
     binding: Binding,
@@ -48,24 +37,25 @@ export async function mail(
     const [action, ...rest] = args;
     const endpoint = `/api/v1/projects/${encodeURIComponent(binding.project)}/d-mail`;
     if (action === "send") {
-        const values = options(rest, ["--to", "--file", "--operation-id"]);
-        if (!values["--to"] || !values["--file"])
+        const values = parseArguments(`d-mail ${action}`, rest, ["to", "file", "operation-id"])
+            .flags as Record<string, string>;
+        if (!values["to"] || !values["file"])
             throw new Refused(
                 "invalid_params",
                 "fug d-mail send needs --to RECIPIENT --file TEXT_FILE",
             );
-        const operation_id = values["--operation-id"] ?? randomUUID();
+        const operation_id = values["operation-id"] ?? randomUUID();
         if (!/^[a-zA-Z0-9._-]{1,128}$/.test(operation_id))
             throw new Refused("invalid_params", "Invalid d-mail operation ID");
         const body = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(
-            await readFile(resolve(values["--file"])),
+            await readFile(resolve(values["file"])),
         );
         if (!body || Buffer.byteLength(body) > 1024 * 1024 || body.includes("\0"))
             throw new Refused(
                 "invalid_params",
                 "d-mail must contain 1 byte through 1 MiB of UTF-8 text",
             );
-        const draft: Draft = { binding, operation_id, recipient: values["--to"], body };
+        const draft: Draft = { binding, operation_id, recipient: values["to"], body };
         const file = join(stateDir(root), "d-mail", `${operation_id}.json`);
         return locked(
             file,
@@ -102,9 +92,10 @@ export async function mail(
         );
     }
     if (action === "read") {
-        const values = options(rest, ["--to", "--after", "--limit", "--output"]);
-        const after = Number(values["--after"] ?? 0),
-            limit = Number(values["--limit"] ?? 20);
+        const values = parseArguments(`d-mail ${action}`, rest, ["to", "after", "limit", "output"])
+            .flags as Record<string, string>;
+        const after = Number(values["after"] ?? 0),
+            limit = Number(values["limit"] ?? 20);
         if (
             !Number.isSafeInteger(after) ||
             after < 0 ||
@@ -114,15 +105,15 @@ export async function mail(
         )
             throw new Refused("invalid_params", "Invalid d-mail cursor or limit");
         const query = new URLSearchParams({
-            recipient: values["--to"] ?? binding.worldline,
+            recipient: values["to"] ?? binding.worldline,
             after: String(after),
             limit: String(limit),
         });
         const reply = await call(core, "GET", `${endpoint}?${query}`);
         if (reply.status !== 200) throw responseError(reply);
         const page = JSON.parse(reply.body) as Page;
-        if (values["--output"]) {
-            const file = resolve(values["--output"]);
+        if (values["output"]) {
+            const file = resolve(values["output"]);
             await save(file, page);
             return {
                 path: file,

@@ -5,7 +5,7 @@ import { lstat, mkdir, writeFile, readFile, rm, chmod, stat, utimes } from "node
 import { join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { createServer } from "node:http";
-import { start, scratch, service } from "./service.mjs";
+import { port, start, scratch, service } from "./service.mjs";
 import { call } from "../build/remote.js";
 import { worldline } from "../build/worldline.js";
 
@@ -484,7 +484,7 @@ test("status, resolve and clean inspect local state without a server", async () 
         await writeFile(
             join(root, ".fughetta/project.json"),
             JSON.stringify({
-                server: "http://127.0.0.1:1",
+                server: `http://127.0.0.1:${await port()}`,
                 workspace: "",
                 project: "demo",
                 worldline: "main",

@@ -1,18 +1,17 @@
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { call, reason, type Connection } from "./remote.js";
-import { json, save } from "./files.js";
+import { call, reason, Refused, type Connection } from "./remote.js";
+import { json, locked, save } from "./files.js";
 import { relay } from "./tunnel.js";
 
-export const releases =
-    "https://api.github.com/repos/FantasticFugue/fughetta-service/releases/latest";
+const releases = "https://api.github.com/repos/FantasticFugue/fughetta-service/releases/latest";
 // The Worker exits with this status when the core refuses its identity: revoked, unknown, or registered to another workspace.
 const refused = 2;
 
-export interface Identity {
+interface Identity {
     server: string;
     workspace: string;
     workspace_id: string;
@@ -54,28 +53,34 @@ export const unitName = (server: string, workspace: string) =>
 // Returns this machine's saved identity for the workspace, registering a new one with the owner's token when there is none.
 export async function identity(core: Connection, name: string): Promise<Identity> {
     const file = join(stateDir(core.server, core.workspace), "identity.json");
-    const saved = await json<Identity | null>(file, null);
-    if (saved) return saved;
-    const reply = await call(core, "POST", "/api/v1/workers", { name }, 30_000);
-    if (reply.status === 403)
-        throw new Error(
-            `Only an owner of ${core.workspace} can add a build machine (${reason(reply)})`,
-        );
-    if (reply.status !== 201)
-        throw new Error(`The build machine could not be registered: ${reason(reply)}`);
-    const credential = JSON.parse(reply.body);
-    const result = {
-        server: core.server,
-        workspace: core.workspace,
-        workspace_id: credential.workspace_id,
-        worker_id: credential.worker_id,
-        secret: credential.secret,
-        name,
-    };
-    await save(file, result);
-    return result;
+    return locked(
+        file,
+        async () => {
+            const saved = await json<Identity | null>(file, null);
+            if (saved) return saved;
+            const reply = await call(core, "POST", "/api/v1/workers", { name }, 30_000);
+            if (reply.status === 403)
+                throw new Error(
+                    `Only an owner of ${core.workspace} can add a build machine (${reason(reply)})`,
+                );
+            if (reply.status !== 201)
+                throw new Error(`The build machine could not be registered: ${reason(reply)}`);
+            const credential = JSON.parse(reply.body);
+            const result = {
+                server: core.server,
+                workspace: core.workspace,
+                workspace_id: credential.workspace_id,
+                worker_id: credential.worker_id,
+                secret: credential.secret,
+                name,
+            };
+            await save(file, result);
+            return result;
+        },
+        core.signal,
+    );
 }
-// Returns the identity saved for the workspace, or, with no workspace named, the only one saved for the server.
+// Selects a saved identity for the workspace or the only identity for the server.
 export async function savedIdentity(server: string, workspace = ""): Promise<Identity | null> {
     if (workspace)
         return json<Identity | null>(join(stateDir(server, workspace), "identity.json"), null);
@@ -85,44 +90,64 @@ export async function savedIdentity(server: string, workspace = ""): Promise<Ide
         const id = await json<Identity | null>(join(base, entry, "identity.json"), null);
         if (id?.server === server) found.push(id);
     }
-    return found.length === 1 ? found[0]! : null;
+    if (found.length > 1) {
+        const workspaces = found
+            .map((id) => id.workspace)
+            .sort()
+            .join(", ");
+        throw new Refused(
+            "invalid_params",
+            `Multiple saved Worker identities for ${server} (${workspaces}). Specify --workspace.`,
+        );
+    }
+    return found[0] ?? null;
 }
 
-const asset = () =>
-    `fughetta-service-${process.platform}-${process.arch}${process.platform === "win32" ? ".exe" : ""}`;
+export async function workerStatus(core: Connection, identity: Identity): Promise<string> {
+    const reply = await call(core, "GET", "/api/v1/workers", undefined, 30_000);
+    if (reply.status !== 200) throw new Error(`Could not read Worker status: ${reason(reply)}`);
+    const workers: { worker_id?: string; name: string; online: boolean; revoked_at?: number }[] =
+        JSON.parse(reply.body);
+    const worker = workers.find((entry) => entry.worker_id === identity.worker_id);
+    let status = "unknown";
+    if (worker)
+        status = worker.revoked_at != null ? "revoked" : worker.online ? "online" : "offline";
+    return `${worker?.name ?? identity.name} (${identity.worker_id}) in ${identity.workspace} is ${status}`;
+}
 
-// Downloads the latest fughetta-service release for this platform once, checks its SHA-256 digest, and returns its path.
-// Without network access the newest cached release is used.
+const asset = (program: string) =>
+    `${program}-${process.platform}-${process.arch}${process.platform === "win32" ? ".exe" : ""}`;
+
+// Downloads the latest fughetta-service release for this platform once, with the fughetta-llvm
+// host beside it, checks their SHA-256 digests, and returns the service's path.
 export async function service(
-    url = process.env.FUGHETTA_RELEASES || releases,
+    url = releases,
     log: (line: string) => void = console.error,
 ): Promise<string> {
-    const name = asset();
-    let release: {
-        tag_name: string;
-        assets: { name: string; browser_download_url: string; digest?: string }[];
-    };
+    const name = asset("fughetta-service");
+    let release: Release;
     try {
         const reply = await fetch(url, {
             headers: { accept: "application/vnd.github+json" },
             signal: AbortSignal.timeout(30_000),
         });
         if (!reply.ok) throw new Error(`HTTP ${reply.status}`);
-        release = (await reply.json()) as typeof release;
+        release = (await reply.json()) as Release;
     } catch (error) {
-        const cached = await newest(name);
-        if (cached) {
-            log(
-                `fug: using the cached ${cached} (the release list is unavailable: ${(error as Error).message})`,
-            );
-            return cached;
-        }
         throw new Error(
             `The fughetta-service release list is unavailable (${(error as Error).message}); pass --service PATH`,
         );
     }
-    if (!/^[A-Za-z0-9._-]+$/.test(release.tag_name))
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(release.tag_name))
         throw new Error(`Unexpected release tag ${release.tag_name}`);
+    await download(release, asset("fughetta-llvm"), log);
+    return download(release, name, log);
+}
+type Release = {
+    tag_name: string;
+    assets: { name: string; browser_download_url: string; digest?: string }[];
+};
+async function download(release: Release, name: string, log: (line: string) => void) {
     const target = join(cacheDir(), release.tag_name, name);
     try {
         await stat(target);
@@ -131,11 +156,11 @@ export async function service(
     const entry = release.assets.find((a) => a.name === name);
     if (!entry)
         throw new Error(
-            `Release ${release.tag_name} has no build for ${process.platform}-${process.arch}; pass --service PATH`,
+            `Release ${release.tag_name} has no ${name} for ${process.platform}-${process.arch}; pass --service PATH`,
         );
     const digest = /^sha256:([0-9a-f]{64})$/.exec(entry.digest ?? "")?.[1];
     if (!digest) throw new Error(`Release ${release.tag_name} lists no SHA-256 digest for ${name}`);
-    log(`fug: downloading fughetta-service ${release.tag_name}`);
+    log(`fug: downloading ${name} ${release.tag_name}`);
     const reply = await fetch(entry.browser_download_url, { signal: AbortSignal.timeout(600_000) });
     if (!reply.ok) throw new Error(`Downloading ${name} failed: HTTP ${reply.status}`);
     const bytes = Buffer.from(await reply.arrayBuffer());
@@ -151,17 +176,21 @@ export async function service(
     }
     return target;
 }
-async function newest(name: string): Promise<string | undefined> {
-    let best: { path: string; time: number } | undefined;
-    for (const tag of await readdir(cacheDir()).catch(() => [] as string[])) {
-        const path = join(cacheDir(), tag, name);
-        const info = await stat(path).catch(() => undefined);
-        if (info && (!best || info.mtimeMs > best.time)) best = { path, time: info.mtimeMs };
-    }
-    return best?.path;
+// The helper hosts beside the service binary, as a release download places them, by the name
+// stages give them. A service given with --service maps whichever of them sit beside it.
+export async function tools(binary: string): Promise<Record<string, string>> {
+    const out: Record<string, string> = {};
+    const path = join(dirname(resolve(binary)), asset("fughetta-llvm"));
+    if (await stat(path).catch(() => undefined)) out["fughetta-llvm"] = path;
+    return out;
 }
-
-export function configuration(id: Identity, gateway: string, dir: string, threads = 8) {
+export function configuration(
+    id: Identity,
+    gateway: string,
+    dir: string,
+    threads = 8,
+    mapped: Record<string, string> = {},
+) {
     return {
         gateway,
         worker_id: id.worker_id,
@@ -172,6 +201,7 @@ export function configuration(id: Identity, gateway: string, dir: string, thread
         work_root: join(dir, "work"),
         compute_threads: threads,
         parallel: threads,
+        tools: mapped,
     };
 }
 
@@ -198,7 +228,7 @@ export async function run(
     process.once("SIGTERM", stop);
     log(`fug: ${id.name} serves builds for ${id.workspace} on ${id.server}; stop with Ctrl-C`);
     try {
-        await save(config, configuration(id, tunnel.address, dir, threads));
+        await save(config, configuration(id, tunnel.address, dir, threads, await tools(binary)));
         for (let wait = 1000; !stopping;) {
             const started = Date.now();
             const command = [resolve(binary), "worker", "run", "--config", config];
@@ -234,23 +264,28 @@ export async function run(
 }
 
 const quote = (arg: string) =>
-    `"${arg.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/%/g, "%%")}"`;
+    `"${arg.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/%/g, "%%").replace(/\r/g, "\\r").replace(/\n/g, "\\n")}"`;
 export function unit(
     server: string,
     workspace: string,
     command: string[],
     extra: string[] = [],
 ): string {
-    const env = process.env.FUGHETTA_CA_FILE
-        ? `Environment=${quote(`FUGHETTA_CA_FILE=${resolve(process.env.FUGHETTA_CA_FILE)}`)}\n`
-        : "";
+    // systemd starts the Worker with the user manager's environment. Preserve
+    // the state and cache paths used to enroll the machine and find its service.
+    const env = ["XDG_STATE_HOME", "XDG_CACHE_HOME", "FUGHETTA_CA_FILE"]
+        .flatMap((name) => {
+            const path = process.env[name];
+            return path ? [`Environment=${quote(`${name}=${resolve(path)}`)}\n`] : [];
+        })
+        .join("");
     return `[Unit]
 Description=Fughetta Worker for ${workspace} on ${new URL(server).host}
 Wants=network-online.target
 After=network-online.target
 
 [Service]
-ExecStart=${[...command, "worker", "--server", server, "--workspace", workspace, ...extra].map(quote).join(" ")}
+ExecStart=${[...command, "worker", "--server", server, "--workspace", workspace, ...extra].map((arg) => quote(arg.replaceAll("$", () => "$$"))).join(" ")}
 ${env}Restart=on-failure
 RestartSec=5
 RestartPreventExitStatus=${refused}

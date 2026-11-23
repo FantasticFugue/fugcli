@@ -232,7 +232,7 @@ test("Gradle, a .NET solution and pyproject each generate one configuration and 
             "pytest",
         );
         assert.equal(python.value.build_configurations.python.operations.test.tasks[0], "test");
-        assert.equal(python.value.analysis.main.stages.python.server.provider, "ty");
+        assert.equal(python.value.analysis, undefined);
     } finally {
         await Promise.all(
             [gradleRoot, dotnetRoot, pythonRoot].map((root) =>
@@ -254,12 +254,9 @@ test("a project without a recognized manifest gets no settings, and a polyglot o
         assert.deepEqual(Object.keys(setup.value.build_configurations), ["debug", "python"]);
         assert.deepEqual(setup.value.default_configurations, ["debug", "python"]);
         assert.deepEqual(Object.keys(setup.value.analysis), ["main"]);
-        assert.deepEqual(Object.keys(setup.value.analysis.main.stages), ["cpp", "python"]);
+        assert.deepEqual(Object.keys(setup.value.analysis.main.stages), ["cpp"]);
         assert.deepEqual(setup.value.analysis.main.outputs, {
-            facts: [
-                { stage: "cpp", output: "facts" },
-                { stage: "python", output: "facts" },
-            ],
+            facts: [{ stage: "cpp", output: "facts" }],
         });
     } finally {
         await rm(empty, { recursive: true, force: true });

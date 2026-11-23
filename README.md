@@ -19,14 +19,14 @@ For Fughetta hosting, run this in the repository you want to send:
 fug init
 ```
 
-The default origin is `https://fughetta.dev`. With no usable token, `fug` opens
+The default origin is `https://gateway.fughetta.dev`. With no usable token, `fug` opens
 sign-in in your browser and also prints the URL. Sign-in uses authorization code
 with PKCE and a temporary listener on `127.0.0.1`; it expires after five minutes.
 The token is saved for that origin. A single workspace is selected automatically.
 For several workspaces, select one at the terminal prompt or supply its name:
 
 ```sh
-fug init --server https://fughetta.dev --workspace my-team --name my-project
+fug init --server https://gateway.fughetta.dev --workspace my-team --name my-project
 ```
 
 Noninteractive sessions must supply `--workspace` when several choices exist.
@@ -39,7 +39,8 @@ fug init --server http://127.0.0.1:8080 --token '<core-token>'
 ```
 
 A core has no workspace prefix or browser sign-in. Hosted requests use
-`/w/{workspace}`. Origins can use IPv6, for example `http://[::1]:8080`.
+`/w/{workspace}`. Remote origins require HTTPS. Plain HTTP is available on
+`localhost`, `127.0.0.1`, and `[::1]` for local cores.
 `FUGHETTA_CA_FILE` selects a PEM certificate authority file for HTTPS.
 
 `init` uses an existing project or creates one. The project name defaults to the
@@ -52,7 +53,7 @@ repository's manifests and writes the graphs they already describe, so the first
 | `CMakeLists.txt` or `CMakePresets.json` | `debug` from the project's debug preset, else Ninja `build/debug` | `cpp` (clice) |
 | `build.gradle`, `build.gradle.kts`, `settings.gradle` or `settings.gradle.kts` | `jvm` (Gradle model export) | `jvm` (kotlin) |
 | a `.sln` or `.slnx` naming, or a checkout holding, `.fsproj` | `dotnet` (MSBuild restore and model) | `dotnet` (fsharp) |
-| `pyproject.toml` with a `[project]`, `[tool.poetry]`, `[tool.pdm]` or `[build-system]` table | `python` (uv environment) | `python` (ty) |
+| `pyproject.toml` with a `[project]`, `[tool.poetry]`, `[tool.pdm]` or `[build-system]` table | `python` (uv environment) | Syntax outline |
 
 Each configuration has a `test` operation when the toolchain has one (CTest,
 Gradle `test`, `dotnet test` for a test project, pytest when declared). The stages
@@ -201,8 +202,9 @@ recover a lost response. `--attestations FILE` on tag/channel reads an array of
 caller's statements alongside the authenticated actor.
 
 `--version` on build/test/run resolves the selected server source without pushing
-the local directory. A checkpoint checkout records the resolved version in its
-binding and is read-only; those execution commands use its pinned source.
+the local directory. A checkpoint checkout verifies each file's size and SHA-256
+digest against the selected manifest before writing it. The binding records the
+resolved version for read-only access and execution.
 `fug push` refuses a pinned checkout. To edit it, run `fug worldline fork NAME`
 there, then check out that new worldline in another directory. The alternate
 checkout spelling is `fug worldline checkout LINE NEW_DIRECTORY --version @TAG`.
@@ -223,10 +225,12 @@ or `--name MACHINE`), and saves its identity in
 `$XDG_STATE_HOME/fughetta/workers/<host>-<workspace>/identity.json` (mode 0600 on Unix;
 `~/.local/state` when unset, `%LOCALAPPDATA%\Fughetta\workers` with an owner-only ACL on Windows).
 Later starts reuse it without a token. `fug` then downloads the latest
-`fughetta-service` release from GitHub for this platform, checks its published
-SHA-256 digest, and caches it under `$XDG_CACHE_HOME/fughetta/service/<tag>/`.
-Without network access it uses the newest cached release. `--service PATH` or
-`FUGHETTA_SERVICE` runs a binary you supply instead.
+`fughetta-service` release from GitHub for this platform, together with
+`fughetta-llvm`, the host native artifact stages run. It checks their published
+SHA-256 digests and caches them under `$XDG_CACHE_HOME/fughetta/service/<tag>/`.
+The Worker configuration maps the `fughetta-llvm` tool to the cached host.
+For offline use, select a binary with `--service PATH` or `FUGHETTA_SERVICE`. A
+`fughetta-llvm-<platform>-<arch>` beside it is mapped the same way.
 
 The Worker connects only outward. `fug` listens on a loopback port and relays
 each Worker connection to the gateway over WebSocket, using the same origin and
@@ -238,6 +242,7 @@ the saved identity; run `fug worker` again to register the machine anew.
 
 ```sh
 fug worker install --workspace my-team     # start now and at every sign-in
+fug worker status --workspace my-team      # report the registered machine’s connection state
 loginctl enable-linger "$USER"             # keep it running while signed out
 fug worker uninstall --workspace my-team
 ```
@@ -301,6 +306,9 @@ messages. Calls run concurrently, use separate remote request IDs, and forward
 cancellation to the correct endpoint. Cancellation also interrupts source sync.
 Long calls stream progress and return the final result in the original call; no
 polling is needed. Language queries prepare missing or stale analysis automatically.
+Without an analysis configuration, `language` with `action: "inspect"` returns
+a Tree-sitter outline of names, kinds, and source ranges. Use a file scope or
+name selector to narrow the result. A semantic view requires an analysis configuration.
 
 ## License
 

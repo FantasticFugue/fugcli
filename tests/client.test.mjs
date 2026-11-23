@@ -51,8 +51,17 @@ test("origin validation and IPv6 HTTP with workspace and bearer token", async ()
         "https://u:p@example.com",
         "https://example.com/path",
         "https://example.com/?q=1",
+        "http://gateway.example",
     ])
         assert.throws(() => origin(url));
+    await assert.rejects(
+        call(
+            { server: "http://gateway.example", workspace: "", token: "secret" },
+            "GET",
+            "/api/v1/me",
+        ),
+        { code: "invalid_origin" },
+    );
     const s = await server((req, res) => {
         assert.equal(req.url, "/w/team/api/v1/projects/demo");
         assert.equal(req.headers.authorization, "Bearer secret");
@@ -124,8 +133,9 @@ test("credential updates serialize across processes and token priority is preser
 
 test("OAuth metadata, code flow and PKCE exchange", async () => {
     let challenge, redirect, state;
+    let discovery = true;
     const s = await server(async (req, res) => {
-        if (req.url === "/.well-known/oauth-authorization-server")
+        if (discovery && req.url === "/.well-known/oauth-authorization-server")
             return reply(res, {
                 authorization_endpoint: s.url + "/authorize",
                 token_endpoint: s.url + "/token",
@@ -169,7 +179,8 @@ test("OAuth metadata, code flow and PKCE exchange", async () => {
             authorize(meta, () => {}, 10),
             /timed out/,
         );
-        assert.equal(await metadata(s.url + "/missing"), undefined);
+        discovery = false;
+        assert.equal(await metadata(s.url), undefined);
     } finally {
         await s.stop();
     }
@@ -225,6 +236,8 @@ test("MCP request errors, push failure, reports, tool filtering and project inje
         requests.push({ path: req.url, ...r });
         if (r.method === "tools/list")
             return reply(res, {
+                jsonrpc: "2.0",
+                id: r.id,
                 result: {
                     tools: [
                         "build",
@@ -638,14 +651,21 @@ test("SSE keepalive renews idle deadline and incomplete streams fail", async () 
         const heartbeat = setInterval(() => res.write(": keepalive\n\n"), 10);
         setTimeout(() => {
             clearInterval(heartbeat);
-            res.end("data: " + JSON.stringify({ id: r.id, result: {} }) + "\n\n");
+            res.end("data: " + JSON.stringify({ jsonrpc: "2.0", id: r.id, result: {} }) + "\n\n");
         }, 120);
     });
     try {
         const core = { server: s.url, workspace: "", token: "t" };
-        assert.deepEqual(await rpc(core, "/mcp", { id: 1 }, 60), { id: 1, result: {} });
+        assert.deepEqual(await rpc(core, "/mcp", { jsonrpc: "2.0", id: 1, method: "ping" }, 60), {
+            jsonrpc: "2.0",
+            id: 1,
+            result: {},
+        });
         incomplete = true;
-        await assert.rejects(rpc(core, "/mcp", { id: 2 }), /without a final MCP response/);
+        await assert.rejects(
+            rpc(core, "/mcp", { jsonrpc: "2.0", id: 2, method: "ping" }),
+            /without a final MCP response/,
+        );
     } finally {
         await s.stop();
     }
@@ -1425,6 +1445,38 @@ test("execute runs a language query and formats its results", async () => {
                     from_view: "before",
                     to_view: "after",
                     changes: [{ subject: { symbol_id: "b", context: "cpp" }, kinds: ["removed"] }],
+                    duplicate_types: [
+                        {
+                            subject: { symbol_id: "new", context: "cpp" },
+                            subject_name: "app::New",
+                            existing: { symbol_id: "old", context: "cpp" },
+                            existing_name: "app::Existing",
+                        },
+                    ],
+                    topology: [
+                        {
+                            kind: "cycle",
+                            modules: [
+                                { project: "app", name: "core" },
+                                { project: "app", name: "api" },
+                            ],
+                        },
+                        {
+                            kind: "fan_out",
+                            modules: [{ project: "app", name: "core" }],
+                            before: 1,
+                            after: 4,
+                        },
+                    ],
+                    degraded_types: [
+                        {
+                            name: "check",
+                            kind: "return_value",
+                            before: "Packet",
+                            after: "std::any",
+                        },
+                        { name: "check", kind: "unsafe_cast", after: "cpp:reinterpret_cast" },
+                    ],
                     reanalysis: [
                         {
                             unit: { project: "app", stage: "source", name: "main" },
@@ -1507,6 +1559,11 @@ test("execute runs a language query and formats its results", async () => {
             ),
         );
         assert.ok(graph.includes("Reanalysis: app/source/main"));
+        assert.ok(graph.includes("Duplicate type shape: app::New can reuse app::Existing [old]"));
+        assert.ok(graph.includes("Dependency cycle: app/core, app/api"));
+        assert.ok(graph.includes("Dependency fan-out: app/core (1 → 4)"));
+        assert.ok(graph.includes("Type degradation in check (return value): Packet → std::any"));
+        assert.ok(graph.includes("Unsafe cast in check (cpp:reinterpret_cast)"));
         assert.ok(graph.includes("  Associated test: app/native/test"));
         assert.ok(graph.includes("removed: b [cpp]"));
         assert.ok(graph.includes("  Base [b] -> Alias [a]  reference use"));

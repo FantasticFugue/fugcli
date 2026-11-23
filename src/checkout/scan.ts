@@ -1,17 +1,16 @@
 // The files of a checkout that are sent, with their digests. Hashes of files unchanged since the last scan come from an index in
 // `.fughetta/state/index.json`, keyed by modification time, change time, inode and size.
-import { createHash } from "node:crypto";
 import { lstat, readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { json, save } from "../files.js";
 import { stateDir } from "./binding.js";
 import { Rules } from "./ignore.js";
 import { prefetch } from "./concurrent.js";
+import { checkoutPathRefusal } from "../paths.js";
+import { digestOf } from "./source.js";
 
-export interface File {
+interface File {
     digest: string;
-    size: number;
-    text: boolean;
     // Unknown where the file system has no executable flag (Windows); the remote flag is kept then.
     executable?: boolean;
 }
@@ -20,29 +19,6 @@ export interface Snapshot {
     files: Map<string, File>;
     // Paths that exist but are not sent, each with the reason.
     skipped: Map<string, string>;
-}
-
-// The core's rule: no NUL byte and well-formed UTF-8 sequences.
-export function textual(bytes: Uint8Array): boolean {
-    for (let i = 0; i < bytes.length;) {
-        const c = bytes[i]!;
-        if (c === 0) return false;
-        const n = c < 0x80 ? 1 : c >> 5 === 6 ? 2 : c >> 4 === 14 ? 3 : c >> 3 === 30 ? 4 : 0;
-        if (!n || i + n > bytes.length) return false;
-        for (let k = 1; k < n; ++k) if (bytes[i + k]! >> 6 !== 2) return false;
-        i += n;
-    }
-    return true;
-}
-
-export const digestOf = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest("hex");
-
-// Why the core refuses a path, or undefined when it accepts it.
-function refusal(path: string): string | undefined {
-    if (path.includes("\\")) return "a name with a backslash";
-    if (path.includes("�")) return "a name that is not UTF-8";
-    if (/[\u0000-\u001f\u007f]/.test(path)) return "a name with a control character";
-    return undefined;
 }
 
 interface Indexed {
@@ -70,7 +46,7 @@ export async function scan(root: string, limit: number, signal?: AbortSignal): P
             const status = await lstat(full, { bigint: true });
             const directory = status.isDirectory();
             if (rules.ignored(path, directory)) return;
-            const refused = refusal(path);
+            const refused = checkoutPathRefusal(path);
             if (refused) {
                 return { path, skipped: refused };
             }
@@ -85,12 +61,12 @@ export async function scan(root: string, limit: number, signal?: AbortSignal): P
             }
             const stamp = `${status.mtimeNs}:${status.ctimeNs}:${status.ino}:${status.size}`;
             const known = index[path];
-            let file: File;
-            if (known?.stamp === stamp) file = { ...known.file };
-            else {
-                const bytes = await readFile(full, { signal });
-                file = { digest: digestOf(bytes), size: bytes.length, text: textual(bytes) };
-            }
+            const file: File = {
+                digest:
+                    known?.stamp === stamp
+                        ? known.file.digest
+                        : digestOf(await readFile(full, { signal })),
+            };
             if (posix) file.executable = (Number(status.mode) & 0o100) !== 0;
 
             // A file written in the last two seconds may change again within the clock's resolution; it is hashed again next time.

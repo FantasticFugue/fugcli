@@ -1,15 +1,28 @@
 #!/usr/bin/env node
 import { basename, join, resolve } from "node:path";
+import { constants } from "node:fs";
+import { access, stat } from "node:fs/promises";
+import { parseArguments } from "./arguments.js";
 import { find, load, save as saveBinding, push } from "./checkout/index.js";
 import { call, origin, responseError, Refused, failure } from "./remote.js";
 import { tokenFor } from "./credentials.js";
 import { connect } from "./login.js";
 import { object } from "./files.js";
-import { report, serve } from "./proxy.js";
+import { normalizeName, validName } from "./names.js";
+import { serve } from "./proxy.js";
+import { report } from "./tool-call.js";
 import { hostname } from "node:os";
 import { mail } from "./mail.js";
 import { branches } from "./branches.js";
-import { identity, install, run, savedIdentity, service, uninstall } from "./worker.js";
+import {
+    identity,
+    install,
+    run,
+    savedIdentity,
+    service,
+    uninstall,
+    workerStatus,
+} from "./worker.js";
 import { execute, format, formatLanguage, languageActions } from "./execute.js";
 import { clean, pendingRecovery, stateUsage } from "./inspect.js";
 import { configure, detect } from "./setup.js";
@@ -42,6 +55,7 @@ const usage = `Usage: fug init [--server URL] [--workspace NAME] [--name PROJECT
        fug d-mail send --to RECIPIENT --file TEXT_FILE [--operation-id ID]
        fug d-mail read [--to RECIPIENT] [--after ID] [--output FILE]
        fug worker [install] [--server URL] [--workspace NAME] [--name MACHINE] [--parallel N] [--service PATH] [--token TOKEN]
+       fug worker status [--server URL] [--workspace NAME] [--token TOKEN]
        fug worker uninstall [--server URL] --workspace NAME
 
 init    create or use a project, configure the toolchains it detects, send files,
@@ -62,7 +76,7 @@ worker  serve this workspace's builds on this machine (owners register it on
         first use); --parallel sets compute threads and build parallelism (default 8);
         install keeps it running as a systemd user service
 
-The default server is https://fughetta.dev.
+The default server is https://gateway.fughetta.dev.
 Token order: --token, FUGHETTA_TOKEN, saved token.
 --json or --text selects output for push, status, build, test, run, language, resolve, clean, worldline, d-mail and help.
 Worldline and d-mail default to JSON; the other commands default to text. Exit status: 0 success, 1 failure, 2 unknown command, 130 cancelled execution.
@@ -116,31 +130,14 @@ function render(value: unknown, json: boolean): string {
     return lines(value).join("\n");
 }
 function options(args: string[], command: string): Record<string, string> {
-    const out: Record<string, string> = {};
-    for (let i = 0; i < args.length; i += 2) {
-        const key = args[i]!;
-        const allowed =
-            command === "uninstall"
-                ? ["--server", "--workspace"]
-                : [
-                      "--server",
-                      "--workspace",
-                      "--token",
-                      ...(command === "init"
-                          ? ["--name"]
-                          : command === "worker"
-                            ? ["--name", "--service", "--parallel"]
-                            : []),
-                  ];
-        if (!allowed.includes(key)) throw new Refused("invalid_params", `Unknown option ${key}`);
-        if (!args[i + 1] || args[i + 1]!.startsWith("--"))
-            throw new Refused("invalid_params", `${key} needs a value`);
-        out[key.slice(2)] = args[i + 1]!;
-    }
-    return out;
+    const flags = ["server", "workspace"];
+    if (command !== "uninstall") flags.push("token");
+    if (command === "init") flags.push("name");
+    if (command === "worker") flags.push("name", "service", "parallel");
+    return parseArguments(command, args, flags).flags as Record<string, string>;
 }
 function name(value: string) {
-    if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$/.test(value))
+    if (!validName(value))
         throw new Refused("invalid_params", `Invalid project or workspace name: ${value}`);
     return value;
 }
@@ -177,99 +174,60 @@ function volume(bytes: number): string {
 }
 // Positional names plus the options each execution tool accepts.
 function executionArgs(cmd: string, args: string[]): Record<string, unknown> {
-    const out: Record<string, unknown> = {};
-    const names: string[] = [],
-        targets: string[] = [];
-    for (let i = 0; i < args.length; ++i) {
-        const item = args[i]!;
-        if (!item.startsWith("--")) {
-            names.push(item);
-            continue;
-        }
-        if (item === "--version") {
-            const value = args[++i];
-            if (!value || value.startsWith("--") || out.version !== undefined)
-                throw new Refused("invalid_params", "Supply --version once with a version or @tag");
-            out.version = value;
-            continue;
-        }
-        if (item === "--fresh" && cmd === "build") {
-            if (out.fresh) throw new Refused("invalid_params", "Repeated --fresh");
-            out.fresh = true;
-            continue;
-        }
-        if ((item === "--filter" || item === "--labels") && cmd === "test") {
-            const value = args[++i];
-            if (!value || value.startsWith("--"))
-                throw new Refused("invalid_params", `${item} needs a value`);
-            if (out[item.slice(2)] !== undefined)
-                throw new Refused("invalid_params", `Repeated ${item}`);
-            out[item.slice(2)] = value;
-            continue;
-        }
-        if (item === "--target" && cmd === "build") {
-            const value = args[++i];
-            if (!value || value.startsWith("--"))
-                throw new Refused("invalid_params", "--target needs a value");
-            targets.push(value);
-            continue;
-        }
-        throw new Refused("invalid_params", `Unknown option ${item}`);
-    }
+    const valueOptions = ["version"];
+    if (cmd === "build") valueOptions.push("target");
+    if (cmd === "test") valueOptions.push("filter", "labels");
+    const { words: names, flags } = parseArguments(
+        cmd,
+        args,
+        valueOptions,
+        true,
+        cmd === "build" ? ["fresh"] : [],
+        ["target"],
+    );
+    const { target: targets, ...out }: Record<string, unknown> = flags;
     if (cmd === "run") {
         if (names.length !== 1)
             throw new Refused("invalid_params", "fug run needs exactly one run configuration name");
         out.configuration = names[0];
     } else if (names.length) out.configurations = names;
-    if (targets.length) out.targets = targets;
+    if (targets) out.targets = targets;
     return out;
 }
 // Positional action plus the query fields each language action accepts.
 function languageArgs(args: string[]): Record<string, unknown> {
-    const out: Record<string, unknown> = {};
-    const positional: string[] = [];
-    for (let i = 0; i < args.length; ++i) {
-        const item = args[i]!;
-        if (!item.startsWith("--")) {
-            positional.push(item);
-            continue;
-        }
-        const value = args[++i];
-        if (!value || value.startsWith("--"))
-            throw new Refused("invalid_params", `${item} needs a value`);
-        if (
-            [
-                "--path",
-                "--symbol",
-                "--configuration",
-                "--provider",
-                "--view",
-                "--from-view",
-                "--to-view",
-                "--entity",
-                "--context",
-                "--module",
-                "--kind",
-                "--include",
-                "--limit",
-                "--cursor",
-                "--relations",
-                "--changes",
-                "--direction",
-                "--depth",
-                "--version",
-                "--outputs",
-                "--continuation",
-                "--budget-nodes",
-                "--budget-units",
-                "--budget-ms",
-            ].includes(item)
-        ) {
-            if (out[item.slice(2)] !== undefined)
-                throw new Refused("invalid_params", `Repeated ${item}`);
-            out[item.slice(2)] = value;
-        } else throw new Refused("invalid_params", `Unknown option ${item}`);
-    }
+    const { words: positional, flags } = parseArguments(
+        "language",
+        args,
+        [
+            "path",
+            "symbol",
+            "configuration",
+            "provider",
+            "view",
+            "from-view",
+            "to-view",
+            "entity",
+            "context",
+            "module",
+            "kind",
+            "include",
+            "limit",
+            "cursor",
+            "relations",
+            "changes",
+            "direction",
+            "depth",
+            "version",
+            "outputs",
+            "continuation",
+            "budget-nodes",
+            "budget-units",
+            "budget-ms",
+        ],
+        true,
+    );
+    const out: Record<string, unknown> = flags;
     if (positional.length > 1)
         throw new Refused("invalid_params", "fug language takes at most one action");
     if (positional.length) {
@@ -405,18 +363,9 @@ async function main() {
         const o = options(args, cmd);
         if (o.workspace) name(o.workspace);
         const project =
-            cmd === "init"
-                ? name(
-                      o.name ??
-                          (basename(process.cwd())
-                              .replace(/[^a-zA-Z0-9._-]/g, "-")
-                              .replace(/^[^a-zA-Z0-9]+/, "")
-                              .slice(0, 64) ||
-                              "project"),
-                  )
-                : "";
+            cmd === "init" ? name(o.name ?? normalizeName(basename(process.cwd()), "project")) : "";
         const core = await connect(
-            origin(o.server ?? "https://fughetta.dev"),
+            origin(o.server ?? "https://gateway.fughetta.dev"),
             o.workspace,
             o.token,
             cmd === "login",
@@ -592,20 +541,43 @@ async function main() {
         const { root, binding, core } = await bound();
         console.log(render(await mail(core, binding, root, args), json));
     } else if (cmd === "worker") {
-        const sub = args[0] === "install" || args[0] === "uninstall" ? args.shift()! : "";
-        const o = options(args, sub === "uninstall" ? sub : "worker");
+        const sub = ["install", "uninstall", "status"].includes(args[0] ?? "") ? args.shift()! : "";
+        const o = options(args, sub === "uninstall" || sub === "status" ? sub : "worker");
         if (o.workspace) name(o.workspace);
-        const server = origin(o.server ?? "https://fughetta.dev");
+        const server = origin(o.server ?? "https://gateway.fughetta.dev");
         if (sub === "uninstall") {
             if (!o.workspace)
                 throw new Refused("invalid_params", "fug worker uninstall needs --workspace");
             await uninstall(server, o.workspace);
             return;
         }
+        if (sub === "status") {
+            const saved = await savedIdentity(server, o.workspace);
+            if (!saved)
+                throw new Refused(
+                    "invalid_params",
+                    "No saved Worker identity. Run fug worker to register this machine.",
+                );
+            const core = await connect(server, saved.workspace, o.token);
+            console.log(await workerStatus(core, saved));
+            return;
+        }
         const parallel = Number(o.parallel ?? "8");
         if (!Number.isSafeInteger(parallel) || parallel < 1)
             throw new Refused("invalid_params", "--parallel must be a positive integer");
+        if (sub === "install" && process.platform !== "linux")
+            throw new Refused(
+                "invalid_params",
+                "fug worker install needs systemd; run fug worker in the foreground on this system",
+            );
         let id = await savedIdentity(server, o.workspace);
+        const given = o.service ?? process.env.FUGHETTA_SERVICE;
+        const binary = given ? resolve(given) : await service();
+        if (given) {
+            if (!(await stat(binary)).isFile())
+                throw new Refused("invalid_params", `Worker service must be a file: ${binary}`);
+            await access(binary, process.platform === "win32" ? constants.F_OK : constants.X_OK);
+        }
         if (!id) {
             const core = await connect(server, o.workspace, o.token);
             if (!core.workspace)
@@ -616,8 +588,6 @@ async function main() {
             id = await identity(core, o.name ?? hostname().slice(0, 128));
             console.error(`fug: registered ${id.name} as ${id.worker_id} in ${id.workspace}`);
         }
-        const given = o.service ?? process.env.FUGHETTA_SERVICE;
-        const binary = given ? resolve(given) : await service();
         if (sub === "install")
             await install(
                 server,

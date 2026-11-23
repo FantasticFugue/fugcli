@@ -6,7 +6,7 @@ import { stateDir } from "./checkout/index.js";
 import { json } from "./files.js";
 import { collectDeliveries } from "./retention.js";
 
-export interface PendingRecovery {
+interface PendingRecovery {
     kind: "recovered" | "collisions" | "conflicts";
     path?: string;
     version?: string;
@@ -80,7 +80,7 @@ async function bytes(path: string): Promise<number> {
     return total;
 }
 
-export interface StateUsage {
+interface StateUsage {
     reports: number;
     artifacts: number;
     other: number;
@@ -102,7 +102,7 @@ export async function stateUsage(root: string): Promise<StateUsage> {
     return usage;
 }
 
-export interface Cleaned {
+interface Cleaned {
     freed: number;
     reports: number;
     artifacts: number;

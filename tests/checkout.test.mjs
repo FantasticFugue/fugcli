@@ -20,9 +20,10 @@ import { spawn } from "node:child_process";
 import { dirname, join } from "node:path";
 import { push, save, changed } from "../build/checkout/index.js";
 import { call } from "../build/remote.js";
+import { Proxy } from "../build/proxy.js";
 import { worldline } from "../build/worldline.js";
 import { branches } from "../build/branches.js";
-import { delta } from "../build/checkout/push.js";
+import { delta, deltas } from "../build/checkout/push.js";
 const tool = (core, _name, args) =>
     worldline(
         core,
@@ -47,6 +48,46 @@ after(async () => {
 
 const digest = (text) => createHash("sha256").update(text).digest("hex");
 const posix = process.platform !== "win32";
+
+test("a pinned checkout removes its destination when a source read differs from its manifest", async () => {
+    const root = await scratch("pinned-checkout");
+    const destination = join(root, "pinned");
+    const version = "selected-version";
+    const file = { path: "source.txt", size: 4, digest: digest("safe"), executable: false };
+    let read = { ...file, version, data_base64: Buffer.from("fake").toString("base64") };
+    const server = createServer(async (request, response) => {
+        let body = "";
+        for await (const chunk of request) body += chunk;
+        const { action } = JSON.parse(body);
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify(action === "inspect" ? { version, files: [file] } : read));
+    });
+    try {
+        await new Promise((resolve, reject) => {
+            server.once("error", reject);
+            server.listen(0, "127.0.0.1", resolve);
+        });
+        const serverUrl = `http://127.0.0.1:${server.address().port}`;
+        const binding = { server: serverUrl, workspace: "", project: "sample", worldline: "main" };
+        const core = { server: serverUrl, workspace: "", token: "secret" };
+        const pinned = () =>
+            branches(core, binding, join(root, "main"), [
+                "checkout",
+                "main",
+                destination,
+                "--version",
+                version,
+            ]);
+        await assert.rejects(pinned(), /Source content verification failed/);
+        await assert.rejects(lstat(destination), { code: "ENOENT" });
+        read = { ...read, digest: digest("fake") };
+        await assert.rejects(pinned(), /Source metadata differs from the manifest/);
+        await assert.rejects(lstat(destination), { code: "ENOENT" });
+    } finally {
+        await new Promise((resolve) => server.close(resolve));
+        await rm(root, { recursive: true, force: true });
+    }
+});
 
 async function spit(root, path, content) {
     await mkdir(dirname(join(root, path)), { recursive: true });
@@ -94,6 +135,34 @@ async function checkout(name, content) {
     await save(root, binding);
     return { root, binding };
 }
+
+test("native edits reach a zero-configuration inspect through the MCP proxy", { skip: service }, async () => {
+    const { root, binding } = await checkout("outline", { "math.py": "def calculate():\n    return 41\n" });
+    const replies = [];
+    const gateway = new Proxy(connection, binding, root, (reply) => replies.push(reply), () => {});
+    const inspect = async (id, name) => {
+        await gateway.line(JSON.stringify({
+            jsonrpc: "2.0",
+            id,
+            method: "tools/call",
+            params: { name: "language", arguments: { action: "inspect", selector: { name: { text: name, path: "math.py" } } } },
+        }));
+        const reply = replies.find((reply) => reply.id === id);
+        assert.ok(reply?.result?.structuredContent, JSON.stringify(reply));
+        return reply.result.structuredContent;
+    };
+
+    const before = await inspect(1, "calculate");
+    assert.equal(before.analyzed, false);
+    assert.equal(before.outline[0].name, "calculate");
+    assert.equal(before.outline[0].source.path, "math.py");
+
+    await spit(root, "math.py", "def calculate_total():\n    return 42\n");
+    const after = await inspect(2, "calculate_total");
+    assert.notEqual(after.version, before.version);
+    assert.equal(after.outline[0].name, "calculate_total");
+    assert.equal(after.outline[0].kind, "function");
+});
 
 test(
     "the first push sends what gitignore rules leave, with executable and binary flags",
@@ -456,14 +525,85 @@ test(
     },
 );
 
-test(
-    "text deltas count Unicode scalars and preserve distant unchanged edges",
-    { skip: service },
-    () => {
-        assert.deepEqual(delta("😀abc界", "😀aX界"), { offset: 2, count: 2, text: "X" });
-        assert.equal(delta("same", "same"), undefined);
-    },
-);
+test("a single text delta counts Unicode scalars and preserves unchanged edges", () => {
+    assert.deepEqual(delta("😀abc界", "😀aX界"), { offset: 2, count: 2, text: "X" });
+    assert.equal(delta("same", "same"), undefined);
+});
+
+const between = "int middle();";
+const functionsBefore = `int first() {\n    return 12;\n}\n${between}\nint last() {\n    return 34;\n}\n`;
+const functionsAfter = functionsBefore.replace("12", "567").replace("34", "8");
+
+function applyHunks(before, hunks) {
+    const scalars = [...before];
+    let nextOffset = scalars.length + 1;
+    for (const { offset, count, text } of [...hunks].reverse()) {
+        assert.ok(offset + count < nextOffset);
+        scalars.splice(offset, count, ...text);
+        nextOffset = offset;
+    }
+    return scalars.join("");
+}
+
+test("text hunks leave declarations between edited function bodies untouched", () => {
+    const hunks = deltas(functionsBefore, functionsAfter);
+    const declaration = functionsBefore.indexOf(between);
+    assert.equal(hunks.length, 2);
+    assert.ok(hunks[0].offset + hunks[0].count <= declaration);
+    assert.ok(hunks[1].offset >= declaration + between.length);
+    assert.equal(applyHunks(functionsBefore, hunks), functionsAfter);
+    assert.deepEqual(deltas(functionsBefore, functionsBefore), []);
+});
+
+test("text hunks use original Unicode scalar offsets across matched lines", () => {
+    const before = "😀a🚀\r\n🧭 keep\r\n界🧪z";
+    const after = "😀a✨\r\n🧭 keep\r\n界z";
+    const hunks = deltas(before, after);
+    assert.deepEqual(hunks, [
+        { offset: 2, count: 1, text: "✨" },
+        { offset: 14, count: 1, text: "" },
+    ]);
+    assert.equal(applyHunks(before, hunks), after);
+});
+
+test("adjacent line edits form one replacement and preserve the gap to the next edit", () => {
+    const before = "red\ngreen\nkeep\nold\nolder";
+    const after = "blue\nkeep\nnew";
+    const hunks = deltas(before, after);
+    assert.deepEqual(hunks, [
+        { offset: 0, count: 9, text: "blue" },
+        { offset: 15, count: 9, text: "new" },
+    ]);
+    assert.equal(applyHunks(before, hunks), after);
+});
+
+test("push sends disjoint edits to one file in a single apply", { skip: service }, async () => {
+    const path = "functions.cpp";
+    const { root, binding } = await checkout("disjoint-hunks", { [path]: functionsBefore });
+    const initial = await push(connection, binding, root);
+    await spit(root, path, functionsAfter);
+    const applies = [];
+    const recording = await proxy((body) => {
+        if (body.includes('"action":"apply"')) applies.push(JSON.parse(body));
+    });
+    try {
+        const pushed = await push(recording.connection, binding, root);
+        assert.equal(pushed.written, 1);
+        assert.equal(applies.length, 1);
+        const [apply] = applies;
+        assert.equal(apply.observed, initial.version);
+        assert.equal(apply.changes.length, 2);
+        assert.ok(apply.changes.every((change) => change.kind === "edit" && change.path === path));
+        assert.equal(applyHunks(functionsBefore, apply.changes), functionsAfter);
+        const read = await worldline(connection, binding, "read", {
+            path,
+            version: pushed.version,
+        });
+        assert.equal(Buffer.from(read.data_base64, "base64").toString("utf8"), functionsAfter);
+    } finally {
+        recording.close();
+    }
+});
 
 test(
     "two checkouts merge independent edits in one worldline without reverting each other",
@@ -768,16 +908,15 @@ for (const when of ["before", "after"])
         `writeback retains editor saves ${when} capturing the previous file`,
         { skip: service },
         async () => {
-            const { syncBuiltinESMExports } = await import("node:module");
-            const fs = await import("node:fs");
+            const { default: fs } = await import("node:fs/promises");
             const { root, binding } = await checkout(`write-race-${when}`, { "x.txt": "abc" });
             await push(connection, binding, root);
             await elsewhere(binding.project, "remote-edit", [
                 { kind: "edit", path: "x.txt", offset: 0, count: 1, text: "A" },
             ]);
-            const original = fs.default.promises.rename;
+            const original = fs.rename;
             let injected = false;
-            fs.default.promises.rename = async (from, to) => {
+            fs.rename = async (from, to) => {
                 const capture =
                     !injected &&
                     String(from) === join(root, "x.txt") &&
@@ -792,13 +931,11 @@ for (const when of ["before", "after"])
                     await writeFile(from, "aBc");
                 }
             };
-            syncBuiltinESMExports();
             let result;
             try {
                 result = await push(connection, binding, root);
             } finally {
-                fs.default.promises.rename = original;
-                syncBuiltinESMExports();
+                fs.rename = original;
             }
             assert.equal(injected, true);
             assert.equal(await readFile(join(root, "x.txt"), "utf8"), "aBc");
@@ -1074,16 +1211,15 @@ for (const type of ["directory", "symlink"])
         `writeback captures a racing ${type} without trapping later syncs`,
         { skip: service },
         async () => {
-            const { syncBuiltinESMExports } = await import("node:module");
-            const fs = await import("node:fs");
+            const { default: fs } = await import("node:fs/promises");
             const { root, binding } = await checkout(`nonregular-${type}`, { "x.txt": "abc" });
             await push(connection, binding, root);
             await elsewhere(binding.project, "remote-edit", [
                 { kind: "edit", path: "x.txt", offset: 0, count: 1, text: "A" },
             ]);
-            const original = fs.default.promises.rename;
+            const original = fs.rename;
             let injected = false;
-            fs.default.promises.rename = async (from, to) => {
+            fs.rename = async (from, to) => {
                 if (
                     !injected &&
                     String(from) === join(root, "x.txt") &&
@@ -1098,13 +1234,11 @@ for (const type of ["directory", "symlink"])
                 }
                 return original(from, to);
             };
-            syncBuiltinESMExports();
             let result;
             try {
                 result = await push(connection, binding, root);
             } finally {
-                fs.default.promises.rename = original;
-                syncBuiltinESMExports();
+                fs.rename = original;
             }
             assert.ok(result.deferred.includes("x.txt"));
             const backup = result.preserved[0];

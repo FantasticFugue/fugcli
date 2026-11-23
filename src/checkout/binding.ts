@@ -3,6 +3,7 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { json } from "../files.js";
+import { origin } from "../remote.js";
 
 export interface Binding {
     server: string;
@@ -30,7 +31,7 @@ export async function load(root: string): Promise<Binding> {
     if (!value?.server || !value.project)
         throw new Error(`${join(root, ".fughetta", "project.json")} names no server and project`);
     return {
-        server: value.server,
+        server: origin(value.server),
         workspace: value.workspace ?? "",
         project: value.project,
         worldline: value.worldline || "main",

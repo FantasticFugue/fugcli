@@ -45,8 +45,7 @@ be removed after use. Do not leave logs behind.
 
 `FUGHETTA_SERVICE` selects the real service binary; its default is
 `../fughetta-service/build/debug/fughetta-service`. Do not modify the service
-repository. `FUGHETTA_RELEASES` replaces the GitHub release API URL that
-`fug worker` downloads from. OAuth tests use an in-process HTTP server and do not require a hosted
+repository. OAuth tests use an in-process HTTP server and do not require a hosted
 gateway. Sync-dependent end-to-end assertions require the completed `push`
 implementation in `src/checkout/`.
 

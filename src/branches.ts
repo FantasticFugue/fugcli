@@ -1,3 +1,4 @@
+import { parseArguments } from "./arguments.js";
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir } from "node:fs/promises";
 import { join, resolve, relative, isAbsolute, sep } from "node:path";
@@ -6,6 +7,7 @@ import { push, save as bind, stateDir, type Binding } from "./checkout/index.js"
 import { Refused, type Connection } from "./remote.js";
 import { worldline } from "./worldline.js";
 import { references, checkoutSnapshot } from "./checkpoints.js";
+import { validName } from "./names.js";
 
 interface Selection {
     from: string;
@@ -23,31 +25,18 @@ interface Promotion {
 function selection(args: string[]): Selection {
     const [from, ...rest] = args;
     if (!from) throw new Refused("invalid_params", "Supply the source worldline");
-    const result: Selection = { from };
-    const keys = {
-        "--version": "version",
-        "--observed": "observed",
-        "--operation-id": "operation_id",
-        "--intent": "intent",
-    } as const;
-    for (let at = 0; at < rest.length; at += 2) {
-        const flag = rest[at]!;
-        if (!Object.hasOwn(keys, flag))
-            throw new Refused("invalid_params", `Unknown worldline option: ${flag}`);
-        const key = keys[flag as keyof typeof keys],
-            value = rest[at + 1];
-        if (!value || value.startsWith("--"))
-            throw new Refused("invalid_params", `${flag} needs a value`);
-        if (result[key] !== undefined)
-            throw new Refused("invalid_params", `${flag} was supplied twice`);
-        result[key] = value;
-    }
+    const { flags } = parseArguments("worldline", rest, [
+        "version",
+        "observed",
+        "operation-id",
+        "intent",
+    ]);
     return {
         from,
-        version: result.version,
-        observed: result.observed,
-        operation_id: result.operation_id,
-        intent: result.intent,
+        version: flags.version as string | undefined,
+        observed: flags.observed as string | undefined,
+        operation_id: flags["operation-id"] as string | undefined,
+        intent: flags.intent as string | undefined,
     };
 }
 
@@ -64,27 +53,13 @@ export async function branches(
     args: string[],
 ): Promise<unknown> {
     const [action, name, destination] = args;
-    const flags = (values: string[], allowed: string[]) => {
-        const out: Record<string, string> = {};
-        for (let i = 0; i < values.length; i += 2) {
-            const flag = values[i]!,
-                value = values[i + 1];
-            if (
-                !allowed.includes(flag) ||
-                !value ||
-                value.startsWith("--") ||
-                out[flag] !== undefined
-            )
-                throw new Refused("invalid_params", `Invalid or repeated option ${flag}`);
-            out[flag] = value;
-        }
-        return out;
-    };
+    const flags = (values: string[], allowed: string[]) =>
+        parseArguments(`worldline ${action}`, values, allowed).flags as Record<string, string>;
     if (action === "references" && args.length === 1)
         return { references: await references(core, binding) };
     if (action === "reference-history") {
-        const options = flags(args.slice(1), ["--after"]);
-        const after = Number(options["--after"] ?? 0);
+        const options = flags(args.slice(1), ["after"]);
+        const after = Number(options["after"] ?? 0);
         if (!Number.isSafeInteger(after) || after < 0)
             throw new Refused("invalid_params", "--after needs a sequence number");
         return worldline(core, binding, "reference_history", { after });
@@ -93,32 +68,32 @@ export async function branches(
         return worldline(core, binding, "receipt", { operation_id: name });
     if (action === "tag" || action === "channel") {
         const options = flags(args.slice(2), [
-            "--version",
-            "--operation-id",
-            "--intent",
-            "--expected",
-            "--attestations",
+            "version",
+            "operation-id",
+            "intent",
+            "expected",
+            "attestations",
         ]);
-        if (!name || !options["--version"] || !options["--operation-id"])
+        if (!name || !options["version"] || !options["operation-id"])
             throw new Refused(
                 "invalid_params",
                 "tag/channel needs NAME, --version and --operation-id",
             );
-        const attestations = options["--attestations"]
-            ? await json<unknown>(resolve(options["--attestations"]), undefined)
+        const attestations = options["attestations"]
+            ? await json<unknown>(resolve(options["attestations"]), undefined)
             : [];
         if (!Array.isArray(attestations))
             throw new Refused("invalid_params", "Attestations file must contain an array");
         return worldline(core, binding, "reference", {
-            version: options["--version"],
-            operation_id: options["--operation-id"],
-            intent: options["--intent"],
-            reference: { name, kind: action, expected: options["--expected"] ?? "", attestations },
+            version: options["version"],
+            operation_id: options["operation-id"],
+            intent: options["intent"],
+            reference: { name, kind: action, expected: options["expected"] ?? "", attestations },
         });
     }
     if (action === "checkout" && name && destination && (name.startsWith("@") || args.length > 3)) {
-        const options = flags(args.slice(3), ["--version"]);
-        const version = options["--version"] ?? (name.startsWith("@") ? name : undefined);
+        const options = flags(args.slice(3), ["version"]);
+        const version = options["version"] ?? (name.startsWith("@") ? name : undefined);
         if (!version) throw new Refused("invalid_params", "checkout needs --version VERSION");
         const target = resolve(destination),
             inside = relative(root, target);
@@ -130,7 +105,7 @@ export async function branches(
         return { directory: target, worldline: next.worldline, version: pinned, read_only: true };
     }
     if (action === "list" && args.length === 1) return await worldline(core, binding, "list");
-    if (!name || !/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$/.test(name))
+    if (!name || !validName(name))
         throw new Refused(
             "invalid_params",
             "Supply a worldline name of 1 through 64 letters, digits, dots, underscores or hyphens",

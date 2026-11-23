@@ -1,22 +1,15 @@
 // Compare local edits with the source version last written to disk, then pull the merged tree.
 import { randomUUID } from "node:crypto";
-import {
-    chmod,
-    link,
-    lstat,
-    mkdir,
-    readFile,
-    readdir,
-    rename,
-    rm,
-    writeFile,
-} from "node:fs/promises";
+import { isUtf8 } from "node:buffer";
+import fs, { chmod, link, lstat, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { json, locked, object, save } from "../files.js";
 import { call, responseError, Refused, type Connection } from "../remote.js";
 import { worldline } from "../worldline.js";
 import { stateDir, type Binding } from "./binding.js";
-import { digestOf, scan, type Snapshot } from "./scan.js";
+import { scan, type Snapshot } from "./scan.js";
+import { digestOf, readSource, verifiedBytes, type FileEntry as Entry } from "./source.js";
+import { checkoutPathRefusal } from "../paths.js";
 import { Rules } from "./ignore.js";
 import { prefetch } from "./concurrent.js";
 
@@ -54,13 +47,6 @@ function retain(digest: string, bytes: Buffer) {
         recent.items.delete(oldest);
         recent.size -= dropped.length;
     }
-}
-interface Entry {
-    digest: string;
-    kind: string;
-    size: number;
-    executable: boolean;
-    data_base64?: string;
 }
 interface Baseline {
     version: string;
@@ -104,7 +90,7 @@ interface Change {
     executable?: boolean;
 }
 interface Edit {
-    change: Change;
+    changes: [Change, ...Change[]];
     version: string;
     after: Record<string, Entry | null>;
 }
@@ -147,6 +133,74 @@ export function delta(
     };
 }
 
+function scalarLength(text: string): number {
+    let length = 0;
+    for (const _ of text) ++length;
+    return length;
+}
+
+export function deltas(
+    before: string,
+    after: string,
+): { offset: number; count: number; text: string }[] {
+    if (before === after) return [];
+    if (Math.max(before.length, after.length) > 200_000) return [delta(before, after)!];
+
+    // Keep line endings in the tokens so matched lines can be copied verbatim.
+    const a = before.match(/[^\n]*\n|[^\n]+$/g) ?? [];
+    const b = after.match(/[^\n]*\n|[^\n]+$/g) ?? [];
+    if (Math.max(a.length, b.length) > 4_000) return [delta(before, after)!];
+
+    let prefix = 0;
+    let offset = 0;
+    while (prefix < a.length && prefix < b.length && a[prefix] === b[prefix]) {
+        offset += scalarLength(a[prefix]!);
+        ++prefix;
+    }
+    let aEnd = a.length;
+    let bEnd = b.length;
+    while (aEnd > prefix && bEnd > prefix && a[aEnd - 1] === b[bEnd - 1]) {
+        --aEnd;
+        --bEnd;
+    }
+
+    const width = bEnd - prefix + 1;
+    const lcs = new Uint16Array((aEnd - prefix + 1) * width);
+    const cell = (i: number, j: number) => (i - prefix) * width + j - prefix;
+    for (let i = aEnd - 1; i >= prefix; --i)
+        for (let j = bEnd - 1; j >= prefix; --j) {
+            const at = cell(i, j);
+            lcs[at] =
+                a[i] === b[j] ? 1 + lcs[at + width + 1]! : Math.max(lcs[at + width]!, lcs[at + 1]!);
+        }
+
+    const hunks = [];
+    let i = prefix;
+    let j = prefix;
+    while (i < aEnd || j < bEnd) {
+        if (i < aEnd && j < bEnd && a[i] === b[j]) {
+            offset += scalarLength(a[i]!);
+            ++i;
+            ++j;
+            continue;
+        }
+        const aStart = i;
+        const bStart = j;
+        // Group adjacent insertions and deletions up to the next nonempty matched line.
+        // Replacing each unmatched block preserves the matched lines and reconstructs after.
+        do {
+            const at = cell(i, j);
+            if (j === bEnd || (i < aEnd && lcs[at + width]! >= lcs[at + 1]!)) ++i;
+            else ++j;
+        } while ((i < aEnd || j < bEnd) && (i === aEnd || j === bEnd || a[i] !== b[j]));
+        const oldBlock = a.slice(aStart, i).join("");
+        const hunk = delta(oldBlock, b.slice(bStart, j).join(""));
+        if (hunk) hunks.push({ ...hunk, offset: offset + hunk.offset });
+        offset += scalarLength(oldBlock);
+    }
+    return hunks;
+}
+
 async function author(core: Connection): Promise<string> {
     const reply = await call(core, "GET", "/api/v1/me");
     if (reply.status !== 200) throw responseError(reply);
@@ -164,19 +218,8 @@ const shadowed = (skipped: Snapshot["skipped"], path: string) => {
     return false;
 };
 async function unavailable(root: string, path: string): Promise<"ignored" | "blocked" | undefined> {
+    if (checkoutPathRefusal(path)) return "ignored";
     const parts = path.split("/");
-    if (
-        parts.some(
-            (p) =>
-                Buffer.byteLength(p, "utf8") > 255 ||
-                !p ||
-                p === "." ||
-                p === ".." ||
-                /[\\\0-\x1f]/.test(p) ||
-                (process.platform === "win32" && p.includes(":")),
-        )
-    )
-        return "ignored";
     let rules = await Rules.root().enter(root, ""),
         relative = "";
     for (let i = 0; i < parts.length; ++i) {
@@ -205,47 +248,17 @@ async function readEntry(path: string): Promise<Entry | undefined> {
         const stat = await lstat(path);
         if (!stat.isFile()) throw new Error(`${path} is not a regular file`);
         const bytes = await readFile(path);
-        let kind = "text";
-        try {
-            const text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
-            if (text.includes("\0")) kind = "binary";
-        } catch {
-            kind = "binary";
-        }
         return {
             digest: digestOf(bytes),
             size: bytes.length,
             executable: process.platform !== "win32" && !!(stat.mode & 0o100),
-            kind,
+            kind: !bytes.includes(0) && isUtf8(bytes) ? "text" : "binary",
             data_base64: bytes.toString("base64"),
         };
     } catch (error) {
         if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
         throw error;
     }
-}
-async function remoteFile(
-    core: Connection,
-    binding: Binding,
-    version: string,
-    path: string,
-    expected?: { digest: string },
-): Promise<Entry> {
-    const file = (await worldline(core, binding, "read", { version, path })) as Entry;
-    const bytes = Buffer.from(file.data_base64!, "base64");
-    if (
-        digestOf(bytes) !== file.digest ||
-        bytes.length !== file.size ||
-        (expected && expected.digest !== file.digest)
-    )
-        throw new Error(`Source content verification failed for ${path}`);
-    return {
-        digest: file.digest,
-        size: file.size,
-        kind: file.kind,
-        executable: file.executable,
-        data_base64: file.data_base64,
-    };
 }
 async function tree(core: Connection, binding: Binding): Promise<Tree> {
     const value = (await worldline(core, binding, "inspect")) as Tree;
@@ -283,12 +296,8 @@ class Ledger {
     async bytes(file: Entry): Promise<Buffer> {
         const known = this.memo.get(file.digest) ?? recall(file.digest);
         if (known) return known;
-        if (file.data_base64 !== undefined) {
-            const bytes = Buffer.from(file.data_base64, "base64");
-            if (bytes.length !== file.size || digestOf(bytes) !== file.digest)
-                throw new Error(`Source content verification failed for ${file.digest}`);
-            return this.keep(file.digest, bytes);
-        }
+        if (file.data_base64 !== undefined)
+            return this.keep(file.digest, verifiedBytes(file, file.digest));
         const baseline = Object.entries(this.state.files).find(
             ([, item]) => item.file?.digest === file.digest,
         );
@@ -300,8 +309,8 @@ class Ledger {
         const local = await readFile(join(this.root, path)).catch(() => undefined);
         if (local && local.length === file.size && digestOf(local) === file.digest)
             return this.keep(file.digest, local);
-        const restored = await remoteFile(this.core, this.state.binding, item.version, path, file);
-        return this.keep(file.digest, Buffer.from(restored.data_base64!, "base64"));
+        const { bytes } = await readSource(this.core, this.state.binding, item.version, path, file);
+        return this.keep(file.digest, bytes);
     }
     async collectRecovered(root: string) {
         const directory = join(dirname(this.path), "recovered");
@@ -354,7 +363,7 @@ class Ledger {
     async cancelJournal(file: string) {
         const pull = this.journals.get(file);
         if (pull?.backup && (await exists(pull.backup))) {
-            await rename(file, `${pull.backup}.json`);
+            await fs.rename(file, `${pull.backup}.json`);
             if (
                 !(await lstat(pull.backup)).isFile() ||
                 !same(await readEntry(pull.backup), pull.before)
@@ -524,7 +533,7 @@ async function open(
     const state: State = { binding, version: remote.version, files: Object.create(null) };
     for await (const { item: file, value } of prefetch(remote.files, async (file) =>
         local.files.has(file.path) && (await allowed(root, file.path))
-            ? remoteFile(core, binding, remote.version, file.path, file)
+            ? (await readSource(core, binding, remote.version, file.path, file)).file
             : undefined,
     )) {
         if (value) state.files[file.path] = { version: remote.version, file: value };
@@ -559,70 +568,83 @@ async function edits(
             version = before?.version ?? state.version;
         if (same(a, b)) continue;
         if (!b || (a && a.kind !== b.kind)) {
-            out.push({ change: { kind: "remove", path }, version, after: { [path]: null } });
+            out.push({ changes: [{ kind: "remove", path }], version, after: { [path]: null } });
             continue;
         }
         if (!a) {
             out.push({
-                change: {
-                    kind: "create",
-                    path,
-                    ...(b.kind === "text"
-                        ? { text: await decode(ledger, b) }
-                        : { data_base64: (await ledger.bytes(b)).toString("base64") }),
-                    executable: b.executable,
-                },
+                changes: [
+                    {
+                        kind: "create",
+                        path,
+                        ...(b.kind === "text"
+                            ? { text: await decode(ledger, b) }
+                            : { data_base64: (await ledger.bytes(b)).toString("base64") }),
+                        executable: b.executable,
+                    },
+                ],
                 version,
                 after: { [path]: b },
             });
             continue;
         }
         if (a.digest !== b.digest) {
-            const change: Change =
+            const changes: Change[] =
                 a.kind === "text"
-                    ? {
+                    ? deltas(await decode(ledger, a), await decode(ledger, b)).map((hunk) => ({
                           kind: "edit",
                           path,
-                          ...delta(await decode(ledger, a), await decode(ledger, b))!,
-                      }
-                    : {
-                          kind: "write",
-                          path,
-                          data_base64: (await ledger.bytes(b)).toString("base64"),
-                      };
-            out.push({ change, version, after: { [path]: { ...b, executable: a.executable } } });
+                          ...hunk,
+                      }))
+                    : [
+                          {
+                              kind: "write",
+                              path,
+                              data_base64: (await ledger.bytes(b)).toString("base64"),
+                          },
+                      ];
+            const [first, ...rest] = changes;
+            if (first)
+                out.push({
+                    changes: [first, ...rest],
+                    version,
+                    after: { [path]: { ...b, executable: a.executable } },
+                });
         } else
             out.push({
-                change: { kind: "mode", path, executable: b.executable },
+                changes: [{ kind: "mode", path, executable: b.executable }],
                 version,
                 after: { [path]: b },
             });
     }
     // An unambiguous unchanged rename keeps the source document's identity.
-    for (const removal of out.filter((e) => e.change.kind === "remove")) {
-        const old = state.files[removal.change.path]?.file;
-        if (!old || local.has(removal.change.path)) continue;
+    for (const removal of out.filter((e) => e.changes[0].kind === "remove")) {
+        const { path } = removal.changes[0];
+        const old = state.files[path]?.file;
+        if (!old || local.has(path)) continue;
         if (
             out.filter(
-                (e) => e.change.kind === "remove" && same(old, state.files[e.change.path]?.file),
+                (e) =>
+                    e.changes[0].kind === "remove" &&
+                    same(old, state.files[e.changes[0].path]?.file),
             ).length !== 1
         )
             continue;
         const matches = out.filter(
             (e) =>
-                e.change.kind === "create" &&
+                e.changes[0].kind === "create" &&
                 e.version === removal.version &&
-                same(old, local.get(e.change.path)),
+                same(old, local.get(e.changes[0].path)),
         );
         if (matches.length !== 1) continue;
-        const creation = matches[0]!;
-        removal.change = {
+        const destination = matches[0]!.changes[0].path;
+        removal.changes[0] = {
             kind: "move",
-            path: removal.change.path,
-            destination: creation.change.path,
+            path,
+            destination,
         };
-        removal.after[creation.change.path] = local.get(creation.change.path)!;
-        out.splice(out.indexOf(creation), 1);
+        removal.after[destination] = local.get(destination)!;
+        out.splice(out.indexOf(matches[0]!), 1);
     }
     return out;
 }
@@ -701,7 +723,7 @@ async function writeback(
     if (backup) {
         await mkdir(dirname(backup), { recursive: true });
         try {
-            await rename(target, backup);
+            await fs.rename(target, backup);
         } catch (error) {
             if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
             await ledger.cancelJournal(journal);
@@ -802,7 +824,11 @@ async function send(core: Connection, binding: Binding, root: string): Promise<P
         let bytes = 0;
         for (const edit of plan) {
             if (edit.version !== version) continue;
-            const size = Buffer.byteLength(JSON.stringify(edit.change));
+            // All hunks for a file use the same observed version and ledger update.
+            const size = edit.changes.reduce(
+                (total, change) => total + Buffer.byteLength(JSON.stringify(change)),
+                0,
+            );
             if (batch.length && bytes + size > 4 << 20) break;
             bytes += size;
             batch.push(edit);
@@ -820,7 +846,7 @@ async function send(core: Connection, binding: Binding, root: string): Promise<P
                 observed: version,
                 operation_id: pending.operation_id,
                 intent: "fug push",
-                changes: batch.map((e) => e.change),
+                changes: batch.flatMap((e) => e.changes),
             });
         } catch (error) {
             if (
@@ -831,7 +857,9 @@ async function send(core: Connection, binding: Binding, root: string): Promise<P
             await ledger.settle(core);
             const latest = await tree(core, binding);
             let repaired = false;
-            for (const { change } of batch) {
+            for (const {
+                changes: [change],
+            } of batch) {
                 const path =
                     change.kind === "create"
                         ? change.path
@@ -855,10 +883,16 @@ async function send(core: Connection, binding: Binding, root: string): Promise<P
                     repaired = true;
                     continue;
                 }
-                const file = await remoteFile(core, binding, latest.version, path, found);
+                const { file, bytes } = await readSource(
+                    core,
+                    binding,
+                    latest.version,
+                    path,
+                    found,
+                );
                 const backup = join(stateDir(root), "collisions", latest.version, path);
                 await mkdir(dirname(backup), { recursive: true });
-                await writeFile(backup, await ledger.bytes(file), {
+                await writeFile(backup, bytes, {
                     flag: "wx",
                     mode: 0o600,
                 }).catch((error) => {
@@ -875,7 +909,9 @@ async function send(core: Connection, binding: Binding, root: string): Promise<P
             continue;
         }
         await ledger.complete(core, pending, receipt);
-        for (const { change } of batch)
+        for (const {
+            changes: [change],
+        } of batch)
             if (!counted.has(change.path)) {
                 counted.add(change.path);
                 if (change.kind === "create") ++out.created;
@@ -908,7 +944,7 @@ async function send(core: Connection, binding: Binding, root: string): Promise<P
         if (file.size > limit || shadowed(current.skipped, file.path)) return;
         const stored = ledger.state.files[file.path]?.file;
         if (stored?.digest === file.digest || (await unavailable(root, file.path))) return;
-        return remoteFile(core, binding, remote.version, file.path, file);
+        return (await readSource(core, binding, remote.version, file.path, file)).file;
     })) {
         core.signal?.throwIfAborted();
         if (file.size > limit || shadowed(current.skipped, file.path)) continue;
@@ -926,7 +962,8 @@ async function send(core: Connection, binding: Binding, root: string): Promise<P
         const content =
             baseline?.digest === file.digest
                 ? { ...baseline, executable: file.executable }
-                : (fetched ?? (await remoteFile(core, binding, remote.version, file.path, file)));
+                : (fetched ??
+                  (await readSource(core, binding, remote.version, file.path, file)).file);
         const wrote = await writeback(
             root,
             ledger,

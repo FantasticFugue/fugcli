@@ -2,16 +2,16 @@ import { createServer } from "node:http";
 import { randomBytes, createHash } from "node:crypto";
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline/promises";
-import { exchange, responseError } from "./remote.js";
+import { exchange, httpUrl, origin, responseError } from "./remote.js";
 import { saveToken, tokenFor } from "./credentials.js";
 
-export interface Metadata {
+interface Metadata {
     authorization_endpoint: string;
     token_endpoint: string;
 }
 export async function metadata(server: string, token = ""): Promise<Metadata | undefined> {
     const reply = await exchange(
-        server + "/.well-known/oauth-authorization-server",
+        origin(server) + "/.well-known/oauth-authorization-server",
         "GET",
         undefined,
         token ? { authorization: `Bearer ${token}` } : {},
@@ -20,11 +20,12 @@ export async function metadata(server: string, token = ""): Promise<Metadata | u
     if (reply.status === 404) return undefined;
     if (reply.status !== 200) throw responseError(reply);
     const value = JSON.parse(reply.body);
-    for (const field of ["authorization_endpoint", "token_endpoint"]) new URL(value[field]);
+    httpUrl(value.authorization_endpoint);
+    httpUrl(value.token_endpoint);
     return value;
 }
 
-export function openBrowser(url: string): void {
+function openBrowser(url: string): void {
     const [command, args] =
         process.platform === "win32"
             ? ["rundll32", ["url.dll,FileProtocolHandler", url]]
@@ -44,6 +45,8 @@ export async function authorize(
     },
     timeout = 300_000,
 ): Promise<string> {
+    const url = httpUrl(meta.authorization_endpoint);
+    const tokenEndpoint = httpUrl(meta.token_endpoint);
     const verifier = randomBytes(32).toString("base64url");
     const state = randomBytes(32).toString("base64url");
     let resolveCode!: (code: string) => void;
@@ -76,7 +79,6 @@ export async function authorize(
         listener.listen(0, "127.0.0.1", resolve);
     });
     const redirect = `http://127.0.0.1:${(listener.address() as { port: number }).port}/callback`;
-    const url = new URL(meta.authorization_endpoint);
     url.search = new URLSearchParams({
         response_type: "code",
         client_id: "fug",
@@ -92,7 +94,7 @@ export async function authorize(
     try {
         show(url.href);
         const reply = await exchange(
-            meta.token_endpoint,
+            tokenEndpoint.href,
             "POST",
             new URLSearchParams({
                 grant_type: "authorization_code",
@@ -121,6 +123,7 @@ export async function authorize(
 }
 
 export async function connect(server: string, workspace = "", given = "", login = false) {
+    server = origin(server);
     let token = await tokenFor(server, given);
     const meta = await metadata(server, token);
     // Signing in replaces a saved token, but not one the user passed.

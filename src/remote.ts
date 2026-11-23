@@ -1,21 +1,33 @@
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { readFile } from "node:fs/promises";
-import { StringDecoder } from "node:string_decoder";
+import { Readable } from "node:stream";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { JSONRPCRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { randomUUID } from "node:crypto";
 import { object } from "./files.js";
 
-export function origin(input: string): string {
-    const url = new URL(input);
+export function httpUrl(input: string): URL {
+    let url: URL;
+    try {
+        url = new URL(input);
+    } catch {
+        throw new Refused("invalid_origin", "Invalid server URL");
+    }
     if (
         !["http:", "https:"].includes(url.protocol) ||
+        (url.protocol === "http:" && !["127.0.0.1", "localhost", "[::1]"].includes(url.hostname)) ||
         url.username ||
-        url.password ||
-        url.pathname !== "/" ||
-        url.search ||
-        url.hash
+        url.password
     )
-        throw new Error("The server URL must name an HTTP or HTTPS origin");
+        throw new Refused("invalid_origin", "The server URL must use HTTPS or loopback HTTP");
+    return url;
+}
+
+export function origin(input: string): string {
+    const url = httpUrl(input);
+    if (url.pathname !== "/" || url.search || url.hash)
+        throw new Refused("invalid_origin", "The server URL must name an origin");
     return url.origin;
 }
 
@@ -93,10 +105,65 @@ export function rpcError(value: unknown): Refused {
     );
 }
 
-interface ExchangeOptions {
-    signal?: AbortSignal;
-    notification?: (value: unknown) => void;
-    requestId?: unknown;
+async function request(
+    url: string,
+    method: string,
+    body: string | undefined,
+    headers: Record<string, string>,
+    timeout: number,
+    signal?: AbortSignal,
+    streamError?: (reason: unknown) => void,
+): Promise<Response> {
+    const endpoint = httpUrl(url);
+    signal?.throwIfAborted();
+    const ca = process.env.FUGHETTA_CA_FILE
+        ? await readFile(process.env.FUGHETTA_CA_FILE)
+        : undefined;
+    signal?.throwIfAborted();
+    return new Promise((resolve, reject) => {
+        const req = (endpoint.protocol === "https:" ? httpsRequest : httpRequest)(
+            endpoint,
+            { method, headers: { accept: "application/json", ...headers }, ca },
+            (incoming) => {
+                incoming.on("data", () => timer.refresh());
+                incoming.once("close", cleanup);
+                incoming.once("error", streamError ?? (() => {}));
+                const responseHeaders = new Headers();
+                for (const [key, value] of Object.entries(incoming.headers))
+                    for (const part of value === undefined
+                        ? []
+                        : Array.isArray(value)
+                          ? value
+                          : [value])
+                        responseHeaders.append(key, part);
+                const status = incoming.statusCode!;
+                const bodyless =
+                    method === "HEAD" || status === 204 || status === 205 || status === 304;
+                if (bodyless) incoming.resume();
+                const stream = bodyless
+                    ? null
+                    : (Readable.toWeb(incoming) as unknown as ReadableStream<Uint8Array>);
+                resolve(new Response(stream, { status, headers: responseHeaders }));
+            },
+        );
+        // This is an idle deadline. Every received byte, including an SSE heartbeat, renews it.
+        const timer = setTimeout(() => {
+            const error = new Refused("timeout", `${url} timed out`);
+            streamError?.(error);
+            req.destroy(error);
+        }, timeout);
+        const abort = () => req.destroy(new Refused("cancelled", "The request was cancelled"));
+        const cleanup = () => {
+            clearTimeout(timer);
+            signal?.removeEventListener("abort", abort);
+        };
+        signal?.addEventListener("abort", abort, { once: true });
+        req.on("error", (error) => {
+            cleanup();
+            reject(error);
+        });
+        req.end(body);
+    });
 }
 
 export async function exchange(
@@ -105,111 +172,10 @@ export async function exchange(
     body?: string,
     headers: Record<string, string> = {},
     timeout = 600_000,
-    options: ExchangeOptions = {},
+    options: { signal?: AbortSignal } = {},
 ): Promise<{ status: number; body: string }> {
-    options.signal?.throwIfAborted();
-    const ca = process.env.FUGHETTA_CA_FILE
-        ? await readFile(process.env.FUGHETTA_CA_FILE)
-        : undefined;
-    options.signal?.throwIfAborted();
-    return new Promise((resolve, reject) => {
-        let settled = false;
-        const finish = (error?: Error, value?: { status: number; body: string }) => {
-            if (settled) return;
-            settled = true;
-            clearTimeout(timer);
-            options.signal?.removeEventListener("abort", abort);
-            if (error) reject(error);
-            else resolve(value!);
-        };
-        const req = (url.startsWith("https:") ? httpsRequest : httpRequest)(
-            url,
-            {
-                method,
-                headers: { accept: "application/json", ...headers },
-                ca,
-            },
-            (res) => {
-                const streaming =
-                    res.statusCode === 200 &&
-                    res.headers["content-type"]?.split(";")[0]?.trim() === "text/event-stream";
-                const decoder = new StringDecoder("utf8");
-                let text = "",
-                    line = "",
-                    data: string[] = [],
-                    afterCR = false;
-                const dispatch = () => {
-                    if (!data.length) return;
-                    const value = JSON.parse(data.join("\n"));
-                    data = [];
-                    if (value.method === "notifications/progress") options.notification?.(value);
-                    else if (
-                        value.id === options.requestId &&
-                        ("result" in value || "error" in value)
-                    ) {
-                        finish(undefined, { status: res.statusCode!, body: JSON.stringify(value) });
-                        res.destroy();
-                    }
-                };
-                const consume = (chunk: string) => {
-                    if (!chunk) return;
-                    let at = 0;
-                    if (afterCR && chunk.startsWith("\n")) at = 1;
-                    afterCR = false;
-                    while (at < chunk.length && !settled) {
-                        const cr = chunk.indexOf("\r", at),
-                            lf = chunk.indexOf("\n", at);
-                        const end = cr < 0 ? lf : lf < 0 ? cr : Math.min(cr, lf);
-                        if (end < 0) {
-                            line += chunk.slice(at);
-                            break;
-                        }
-                        line += chunk.slice(at, end);
-                        if (!line) dispatch();
-                        else if (line === "data") data.push("");
-                        else if (line.startsWith("data:"))
-                            data.push(line.slice(5).replace(/^ /, ""));
-                        line = "";
-                        at = end + 1;
-                        if (chunk[end] === "\r") {
-                            if (at === chunk.length) afterCR = true;
-                            else if (chunk[at] === "\n") ++at;
-                        }
-                    }
-                };
-                res.on("data", (chunk: Buffer) => {
-                    timer.refresh();
-                    try {
-                        if (streaming) consume(decoder.write(chunk));
-                        else text += decoder.write(chunk);
-                    } catch (error) {
-                        finish(error as Error);
-                        req.destroy();
-                    }
-                });
-                res.on("error", (error) => finish(error));
-                res.on("end", () => {
-                    if (settled) return;
-                    if (streaming)
-                        finish(
-                            new Error(
-                                "The core closed the SSE stream without a final MCP response",
-                            ),
-                        );
-                    else finish(undefined, { status: res.statusCode!, body: text + decoder.end() });
-                });
-            },
-        );
-        // This is an idle deadline. Execution limits belong to the project configuration.
-        const timer = setTimeout(
-            () => req.destroy(new Refused("timeout", `${url} timed out`)),
-            timeout,
-        );
-        const abort = () => req.destroy(new Refused("cancelled", "The request was cancelled"));
-        options.signal?.addEventListener("abort", abort, { once: true });
-        req.on("error", (error) => finish(error));
-        req.end(body);
-    });
+    const response = await request(url, method, body, headers, timeout, options.signal);
+    return { status: response.status, body: await response.text() };
 }
 
 export function reason(reply: { status: number; body: string }): string {
@@ -229,7 +195,7 @@ export async function call(
     timeout?: number,
 ) {
     return exchange(
-        core.server + (core.workspace ? `/w/${core.workspace}` : "") + path,
+        origin(core.server) + (core.workspace ? `/w/${core.workspace}` : "") + path,
         method,
         body === undefined ? undefined : JSON.stringify(body),
         { "content-type": "application/json", authorization: `Bearer ${core.token}` },
@@ -241,24 +207,104 @@ export async function call(
 export async function rpc(
     core: Connection,
     path: string,
-    request: Record<string, unknown> & { id?: unknown },
+    message: Record<string, unknown>,
     timeout?: number,
     notification?: (value: unknown) => void,
 ): Promise<unknown> {
-    const r = await exchange(
-        core.server + (core.workspace ? `/w/${core.workspace}` : "") + path,
-        "POST",
-        JSON.stringify(request),
+    const frame = JSONRPCRequestSchema.parse(message);
+    core.signal?.throwIfAborted();
+    let resolve!: (reply: unknown) => void;
+    let reject!: (reason: unknown) => void;
+    const answer = new Promise<unknown>((success, failure) => {
+        resolve = success;
+        reject = failure;
+    });
+    void answer.catch(() => {});
+    let streamed = false;
+    let eof: ReturnType<typeof setTimeout> | undefined;
+    const transport = new StreamableHTTPClientTransport(
+        new URL(origin(core.server) + (core.workspace ? `/w/${core.workspace}` : "") + path),
         {
-            accept: "text/event-stream, application/json",
-            "content-type": "application/json",
-            authorization: `Bearer ${core.token}`,
+            reconnectionOptions: {
+                initialReconnectionDelay: 0,
+                maxReconnectionDelay: 0,
+                reconnectionDelayGrowFactor: 1,
+                maxRetries: 0,
+            },
+            fetch: async (url, init) => {
+                const headers = Object.fromEntries(new Headers(init?.headers));
+                const response = await request(
+                    String(url),
+                    "POST",
+                    String(init?.body),
+                    {
+                        ...headers,
+                        authorization: `Bearer ${core.token}`,
+                    },
+                    timeout ?? 600_000,
+                    init?.signal ?? undefined,
+                    reject,
+                );
+                if (response.status !== 200)
+                    throw responseError({ status: response.status, body: await response.text() });
+                const media = response.headers.get("content-type")?.split(";")[0]?.trim();
+                if (media === "application/json") return response;
+                if (media !== "text/event-stream") {
+                    await response.body?.cancel();
+                    throw new Refused(
+                        "invalid_response",
+                        "The core sent an unsupported MCP content type",
+                    );
+                }
+                streamed = true;
+                let bytes = 0;
+                const stream = response.body?.pipeThrough(
+                    new TransformStream<Uint8Array, Uint8Array>({
+                        transform(chunk, output) {
+                            bytes += chunk.byteLength;
+                            if (bytes > 64 * 1024 * 1024)
+                                throw new RangeError("The MCP response exceeds 64 MiB");
+                            output.enqueue(chunk);
+                        },
+                        flush() {
+                            eof = setTimeout(
+                                () =>
+                                    reject(
+                                        new Error(
+                                            "The core closed the SSE stream without a final MCP response",
+                                        ),
+                                    ),
+                                0,
+                            );
+                        },
+                    }),
+                );
+                return new Response(stream, { status: response.status, headers: response.headers });
+            },
         },
-        timeout,
-        { signal: core.signal, notification, requestId: request.id },
     );
-    if (r.status !== 200) throw responseError(r);
-    return JSON.parse(r.body);
+    transport.onmessage = (value) => {
+        if ("method" in value && value.method === "notifications/progress") notification?.(value);
+        else if ("id" in value && value.id === frame.id) resolve(value);
+    };
+    transport.onerror = reject;
+    const abort = () => {
+        reject(new Refused("cancelled", "The request was cancelled"));
+        void transport.close();
+    };
+    core.signal?.addEventListener("abort", abort, { once: true });
+    try {
+        await transport.start();
+        core.signal?.throwIfAborted();
+        await transport.send(frame);
+        if (!streamed)
+            reject(new Refused("invalid_response", "The core sent no matching MCP reply"));
+        return await answer;
+    } finally {
+        clearTimeout(eof);
+        core.signal?.removeEventListener("abort", abort);
+        await transport.close();
+    }
 }
 
 // These views describe fields consumed from MCP; payloads remain unknown.

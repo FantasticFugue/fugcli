@@ -17,7 +17,7 @@ test("the Codex table is written once beside the tables the file already holds",
         assert.equal(await registerCodex(file), true);
         assert.match(
             await read(root, ".codex/config.toml"),
-            /^\[mcp_servers\.fughetta\]\ncommand = ".+"\nargs = \[.*"mcp"\]\n$/,
+            /^\[mcp_servers\.fughetta\]\ncommand = ".+"\nargs = \[.*"mcp"\s*\]\n$/,
         );
         await writeFile(file, '[mcp_servers.other]\ncommand = "other"');
         assert.equal(await registerCodex(file), true);

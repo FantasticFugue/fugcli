@@ -20,10 +20,15 @@
         "format:check": "oxfmt --check ."
     },
     "dependencies": {
-        "ignore": "^7.0.14"
+        "@modelcontextprotocol/sdk": "^1.32.2",
+        "argparse": "^3.0.4",
+        "ignore": "^7.0.14",
+        "smol-toml": "^1.9.1",
+        "ws": "^8.23.0"
     },
     "devDependencies": {
         "@types/node": "^22.0.0",
+        "@types/ws": "^8.18.2",
         "oxfmt": "^0.72.0",
         "typescript": "^7.0.2"
     },

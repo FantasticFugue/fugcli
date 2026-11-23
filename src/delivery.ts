@@ -5,10 +5,10 @@ import { createHash } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import { object, json, save, locked } from "./files.js";
 import { beginDelivery, endDelivery, collectDeliveries, deliveryLock } from "./retention.js";
+import { portablePath } from "./paths.js";
 import { stateDir } from "./checkout/index.js";
 import { type Connection, call, responseError } from "./remote.js";
 
-// Property views preserve the existing optional access and parse failures for malformed reports.
 type TextContent = Record<string, unknown> & { type: "text"; text: string };
 type StructuredReport = Record<string, unknown> & { results: unknown[] };
 
@@ -60,27 +60,6 @@ function replaceStructured(result: Record<string, unknown>, copied: unknown) {
             return item;
         });
     result.structuredContent = copied;
-}
-
-function portablePath(path: unknown): string {
-    if (
-        typeof path !== "string" ||
-        !path ||
-        path
-            .split("/")
-            .some(
-                (part) =>
-                    !part ||
-                    part === "." ||
-                    part === ".." ||
-                    Buffer.byteLength(part) > 255 ||
-                    /[\\\x00-\x1f\x7f:]/.test(part) ||
-                    /[. ]$/.test(part) ||
-                    /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\.|$)/i.test(part),
-            )
-    )
-        throw new Error("Unsupported export path");
-    return path;
 }
 
 export async function localExports(

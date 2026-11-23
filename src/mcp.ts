@@ -2,9 +2,10 @@
 import { existsSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { delimiter, dirname, join } from "node:path";
+import { parse, stringify } from "smol-toml";
 import { object, save } from "./files.js";
 
-export interface Entry {
+interface Entry {
     command: string;
     args: string[];
     [key: string]: unknown;
@@ -46,11 +47,26 @@ export async function registerCodex(file: string, entry = command()): Promise<bo
     } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     }
-    if (/^\s*\[mcp_servers\.fughetta\]\s*$/m.test(existing)) return false;
+    const configuration = parse(existing);
+    const servers = configuration.mcp_servers;
+    if (servers !== undefined && !object(servers))
+        throw new Error(`${file} must declare mcp_servers as a table`);
+    if (servers && Object.hasOwn(servers, "fughetta")) return false;
     const head = existing && !existing.endsWith("\n") ? `${existing}\n` : existing;
-    const args = entry.args.map((arg) => JSON.stringify(arg)).join(", ");
-    const table = `[mcp_servers.fughetta]\ncommand = ${JSON.stringify(entry.command)}\nargs = [${args}]\n`;
+    const table = stringify({
+        mcp_servers: { fughetta: { command: entry.command, args: entry.args } },
+    });
+    let updated = head ? `${head}\n${table}` : table;
+    try {
+        parse(updated);
+    } catch {
+        // Inline and dotted tables can seal their parent against an appended declaration.
+        updated = stringify({
+            ...configuration,
+            mcp_servers: { ...servers, fughetta: { command: entry.command, args: entry.args } },
+        });
+    }
     await mkdir(dirname(file), { recursive: true });
-    await writeFile(file, head ? `${head}\n${table}` : table);
+    await writeFile(file, updated);
     return true;
 }

@@ -1,5 +1,6 @@
 import { readdir, lstat, readFile, rm, writeFile, utimes } from "node:fs/promises";
 import { join } from "node:path";
+import { pathRefusal } from "./paths.js";
 import { locked } from "./files.js";
 
 const day = 86400000;
@@ -69,19 +70,12 @@ export async function collectDeliveries(
                 const record = join(index, entry.name);
                 try {
                     const value = JSON.parse(await readFile(record, "utf8"));
-                    const parts = typeof value?.path === "string" ? value.path.split("/") : [];
-                    if (
-                        !parts[0]?.startsWith("execution-") ||
-                        parts.some(
-                            (part: string) =>
-                                !part || part === "." || part === ".." || /[\\:]/.test(part),
-                        )
-                    ) {
+                    if (pathRefusal(value?.path) || !value.path.startsWith("execution-")) {
                         await rm(record, { force: true });
                         continue;
                     }
                     try {
-                        await lstat(join(parent, ...parts));
+                        await lstat(join(parent, value.path));
                     } catch (error) {
                         if ((error as NodeJS.ErrnoException).code === "ENOENT")
                             await rm(record, { force: true });

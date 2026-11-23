@@ -5,9 +5,10 @@ import { join } from "node:path";
 import { call, responseError, type Connection } from "./remote.js";
 import { generated as rulesFile, Rules } from "./checkout/ignore.js";
 import { object } from "./files.js";
+import { normalizeName } from "./names.js";
 
 type Settings = Record<string, unknown>;
-export interface Setup {
+interface Setup {
     // One line per detected toolchain and per warning, in the order they were found.
     summary: string[];
     // The project settings to save; it holds only the fields the detection generated.
@@ -49,15 +50,6 @@ async function names(root: string, match: RegExp): Promise<string[]> {
 
 const sorted = <T>(value: Record<string, T>) =>
     Object.fromEntries(Object.entries(value).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)));
-
-// A configuration name the core accepts: 1-64 letters, digits, dots, underscores or hyphens, starting with a letter or digit.
-function configuration(name: string, fallback: string): string {
-    const value = name
-        .replace(/[^A-Za-z0-9._-]/g, "-")
-        .replace(/^[^A-Za-z0-9]+/, "")
-        .slice(0, 64);
-    return value || fallback;
-}
 
 // The CMake configure preset the configuration asks CMake for: a debug preset when the project names one, else the first
 // visible preset in file order. A hidden preset cannot be selected, so it is never chosen.
@@ -326,7 +318,7 @@ export async function detect(root: string): Promise<Setup | undefined> {
             ? await readJson(join(root, "CMakePresets.json"))
             : undefined;
         const preset = preferredPreset(manifest);
-        const name = configuration(preset ?? "debug", "debug");
+        const name = normalizeName(preset ?? "debug", "debug");
         const buildDirectory = `build/${name}`;
         // A vcpkg manifest needs a toolchain file. A preset owns its choice; a checkout that vendors vcpkg supplies its own.
         const vendored = "vcpkg/scripts/buildsystems/vcpkg.cmake";
@@ -405,17 +397,8 @@ export async function detect(root: string): Promise<Setup | undefined> {
         /^\s*\[(project|tool\.poetry|tool\.pdm|build-system)\]/m.test(pyproject);
     if (pythonproject) {
         builds.python = python(/\bpytest\b/.test(pyproject!));
-        stages.python = {
-            server: { provider: "ty" },
-            build_configuration: "python",
-            inputs: {
-                python_environment: [
-                    { configuration: "python", task: "sync", output: "python_environment" },
-                ],
-            },
-        };
         ignored.push(".venv", "dist");
-        summary.push("Configured uv as build configuration python and analysis stage python (ty)");
+        summary.push("Configured uv as build configuration python");
     }
 
     const configurations = Object.keys(builds).sort();
